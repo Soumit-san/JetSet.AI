@@ -1,0 +1,214 @@
+/* ═══════════════════════════════════════════════════════════
+   JETTY MASCOT — CSS Animation System
+   JetSet.AI's Personal Travel Copilot
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── Idle Float ────────────────────────────────────────── */
+@keyframes jetty-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+
+/* ── Hover / Happy Bounce ──────────────────────────────── */
+@keyframes jetty-bounce {
+  0%, 100% { transform: translateY(0) scale(1); }
+  30% { transform: translateY(-8px) scale(1.05); }
+  50% { transform: translateY(-4px) scale(1.02); }
+  70% { transform: translateY(-6px) scale(1.04); }
+}
+
+/* ── Thinking Tilt ─────────────────────────────────────── */
+@keyframes jetty-tilt {
+  0%, 100% { transform: rotate(0deg) translateY(0); }
+  25% { transform: rotate(-5deg) translateY(-3px); }
+  75% { transform: rotate(3deg) translateY(-2px); }
+}
+
+/* ── Talking Oscillation ───────────────────────────────── */
+@keyframes jetty-talk {
+  0%, 100% { transform: scale(1) translateY(0); }
+  25% { transform: scale(1.02) translateY(-2px); }
+  50% { transform: scale(0.98) translateY(0); }
+  75% { transform: scale(1.01) translateY(-1px); }
+}
+
+/* ── Greeting Entrance ─────────────────────────────────── */
+@keyframes jetty-entrance {
+  0% { transform: translateY(30px) scale(0.8); opacity: 0; }
+  60% { transform: translateY(-5px) scale(1.05); opacity: 1; }
+  100% { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+/* ── Excited Bounce ────────────────────────────────────── */
+@keyframes jetty-excited {
+  0%, 100% { transform: translateY(0) scale(1) rotate(0deg); }
+  15% { transform: translateY(-10px) scale(1.08) rotate(-3deg); }
+  30% { transform: translateY(-2px) scale(1.02) rotate(2deg); }
+  45% { transform: translateY(-8px) scale(1.06) rotate(-2deg); }
+  60% { transform: translateY(-3px) scale(1.01) rotate(1deg); }
+  75% { transform: translateY(-6px) scale(1.04) rotate(-1deg); }
+}
+
+/* ── Sleepy Breathe ────────────────────────────────────── */
+@keyframes jetty-breathe {
+  0%, 100% { transform: scale(1) translateY(0); }
+  50% { transform: scale(1.03) translateY(1px); }
+}
+
+/* ── Error Wiggle ──────────────────────────────────────── */
+@keyframes jetty-wiggle {
+  0%, 100% { transform: rotate(0deg); }
+  20% { transform: rotate(-4deg); }
+  40% { transform: rotate(4deg); }
+  60% { transform: rotate(-3deg); }
+  80% { transform: rotate(2deg); }
+}
+
+/* ── Sparkle Particles ─────────────────────────────────── */
+@keyframes jetty-sparkle {
+  0% { opacity: 0; transform: scale(0) translateY(0); }
+  50% { opacity: 1; transform: scale(1) translateY(-8px); }
+  100% { opacity: 0; transform: scale(0.5) translateY(-16px); }
+}
+
+/* ── Speech Bubble ─────────────────────────────────────── */
+@keyframes jetty-bubble-in {
+  0% { opacity: 0; transform: scale(0.8) translateY(5px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes jetty-bubble-out {
+  0% { opacity: 1; transform: scale(1) translateY(0); }
+  100% { opacity: 0; transform: scale(0.8) translateY(5px); }
+}
+
+/* ── Thinking Dots ─────────────────────────────────────── */
+@keyframes jetty-dot {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1.2); }
+}
+
+/* ── Glow Pulse (launcher) ─────────────────────────────── */
+@keyframes jetty-glow {
+  0%, 100% { box-shadow: 0 4px 20px rgba(96, 165, 250, 0.2); }
+  50% { box-shadow: 0 4px 30px rgba(96, 165, 250, 0.4); }
+}
+
+/* ── State Classes ─────────────────────────────────────── */
+
+.jetty-idle {
+  animation: jetty-float 4.5s ease-in-out infinite;
+}
+
+.jetty-greeting {
+  animation: jetty-entrance 0.6s ease-out forwards;
+}
+
+.jetty-hover {
+  animation: jetty-bounce 0.5s ease-out;
+}
+
+.jetty-listening {
+  animation: jetty-tilt 2.5s ease-in-out infinite;
+}
+
+.jetty-thinking {
+  animation: jetty-tilt 2s ease-in-out infinite;
+}
+
+.jetty-talking {
+  animation: jetty-talk 0.4s ease-in-out infinite;
+}
+
+.jetty-happy {
+  animation: jetty-bounce 0.6s ease-out;
+}
+
+.jetty-excited {
+  animation: jetty-excited 0.8s ease-in-out infinite;
+}
+
+.jetty-confused {
+  animation: jetty-tilt 1.8s ease-in-out infinite;
+}
+
+.jetty-error {
+  animation: jetty-wiggle 0.5s ease-in-out 2;
+}
+
+.jetty-sleepy {
+  animation: jetty-breathe 3s ease-in-out infinite;
+}
+
+/* ── Sparkle Decorations ───────────────────────────────── */
+.jetty-sparkle {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #fbbf24;
+  pointer-events: none;
+  animation: jetty-sparkle 1.5s ease-out forwards;
+}
+
+.jetty-sparkle:nth-child(1) { top: 10%; left: 10%; animation-delay: 0s; }
+.jetty-sparkle:nth-child(2) { top: 5%; right: 15%; animation-delay: 0.3s; }
+.jetty-sparkle:nth-child(3) { top: 15%; right: 5%; animation-delay: 0.6s; }
+
+/* ── Thinking Dots ─────────────────────────────────────── */
+.jetty-dots {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+  margin-top: 4px;
+}
+
+.jetty-dots span {
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #60a5fa;
+  animation: jetty-dot 1.4s ease-in-out infinite;
+}
+
+.jetty-dots span:nth-child(2) { animation-delay: 0.2s; }
+.jetty-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+/* ── Launcher Glow ─────────────────────────────────────── */
+.jetty-launcher {
+  animation: jetty-glow 3s ease-in-out infinite;
+}
+
+/* ── Speech Bubble ─────────────────────────────────────── */
+.jetty-speech-bubble {
+  animation: jetty-bubble-in 0.3s ease-out forwards;
+}
+
+.jetty-speech-bubble-exit {
+  animation: jetty-bubble-out 0.25s ease-in forwards;
+}
+
+/* ── Accessibility: Reduced Motion ─────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .jetty-idle,
+  .jetty-greeting,
+  .jetty-hover,
+  .jetty-listening,
+  .jetty-thinking,
+  .jetty-talking,
+  .jetty-happy,
+  .jetty-excited,
+  .jetty-confused,
+  .jetty-error,
+  .jetty-sleepy,
+  .jetty-sparkle,
+  .jetty-launcher {
+    animation: none !important;
+  }
+
+  .jetty-speech-bubble {
+    animation: none !important;
+    opacity: 1;
+  }
+}

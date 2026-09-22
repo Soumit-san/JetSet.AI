@@ -19,7 +19,8 @@
       }
     ],
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@jetset/shared": ["../shared/types/index.ts"]
     }
   },
   "include": [
