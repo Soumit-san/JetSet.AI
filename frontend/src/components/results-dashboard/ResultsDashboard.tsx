@@ -12,6 +12,7 @@ import SeasonModule from "./modules/SeasonModule";
 import ItineraryModule from "./modules/ItineraryModule";
 import SummaryModule from "./modules/SummaryModule";
 import { getApiUrl } from "@/utils/api";
+import { useCopilotStore } from "@/store/copilotStore";
 
 interface ResultsDashboardProps {
     tripId: string;
@@ -33,6 +34,12 @@ export default function ResultsDashboard({ tripId, org, dest, dates, curr }: Res
     const [activeTab, setActiveTab] = useState("summary");
     const [visitedTabs, setVisitedTabs] = useState<string[]>(["summary"]);
     const [showScrollBtn, setShowScrollBtn] = useState(false);
+    
+    const { setActiveView } = useCopilotStore();
+
+    useEffect(() => {
+        setActiveView(activeTab);
+    }, [activeTab, setActiveView]);
 
     // Warning Modal State
     const [warning, setWarning] = useState<{ title: string; message: string } | null>(null);

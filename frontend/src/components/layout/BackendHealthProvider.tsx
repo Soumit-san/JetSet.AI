@@ -108,7 +108,7 @@ export function BackendHealthProvider({ children }: { children: React.ReactNode 
             
             {/* Global micro-banner when waking up/connecting */}
             {status === 'waking' && (
-                <div className="fixed bottom-4 right-4 z-50 max-w-sm bg-ink-950/95 border border-sky-500/30 rounded-xl p-4 shadow-[0_10px_30px_rgba(14,165,233,0.15)] backdrop-blur-md animate-fade-in-up">
+                <div className="fixed bottom-4 left-4 z-50 max-w-sm bg-ink-950/95 border border-sky-500/30 rounded-xl p-4 shadow-[0_10px_30px_rgba(14,165,233,0.15)] backdrop-blur-md animate-fade-in-up">
                     <div className="flex items-center gap-3">
                         <div className="relative flex items-center justify-center w-8 h-8 rounded-full bg-sky-500/10 text-sky-400">
                             <Loader2 className="w-4.5 h-4.5 animate-spin" />
@@ -134,7 +134,7 @@ export function BackendHealthProvider({ children }: { children: React.ReactNode 
 
             {/* Offline Error Banner if server can't be reached at all */}
             {status === 'offline' && (
-                <div className="fixed bottom-4 right-4 z-50 max-w-sm bg-ink-950/95 border border-red-500/30 rounded-xl p-4 shadow-[0_10px_30px_rgba(239,68,68,0.15)] backdrop-blur-md animate-fade-in-up">
+                <div className="fixed bottom-4 left-4 z-50 max-w-sm bg-ink-950/95 border border-red-500/30 rounded-xl p-4 shadow-[0_10px_30px_rgba(239,68,68,0.15)] backdrop-blur-md animate-fade-in-up">
                     <div className="flex items-center gap-3">
                         <div className="flex items-center justify-center w-8 h-8 rounded-full bg-red-500/10 text-red-400">
                             <WifiOff className="w-4.5 h-4.5" />

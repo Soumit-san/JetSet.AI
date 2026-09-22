@@ -11,6 +11,7 @@ import { HotelsModule } from './hotels/hotels.module';
 import { TripsModule } from './trips/trips.module';
 import { RagModule } from './rag/rag.module';
 import { AiModule } from './ai/ai.module';
+import { CopilotModule } from './copilot/copilot.module';
 
 @Module({
   imports: [
@@ -110,6 +111,7 @@ import { AiModule } from './ai/ai.module';
     TripsModule,
     RagModule,
     AiModule,
+    CopilotModule,
   ],
   controllers: [AppController],
   providers: [AppService],

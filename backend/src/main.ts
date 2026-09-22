@@ -7,6 +7,6 @@ async function bootstrap() {
 
   app.enableCors(); // Allow all origins for local development
 
-  await app.listen(process.env.PORT ?? 3001);
+  await app.listen(process.env.PORT ?? 3001, '0.0.0.0');
 }
 bootstrap();

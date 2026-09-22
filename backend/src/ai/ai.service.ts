@@ -121,7 +121,7 @@ export class AiService {
     if (key.startsWith('gsk_')) {
       return {
         url: 'https://api.groq.com/openai/v1/chat/completions',
-        model: 'llama-3.3-70b-versatile',
+        model: 'openai/gpt-oss-20b',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${key}`,
