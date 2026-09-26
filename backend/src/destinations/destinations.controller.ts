@@ -7,7 +7,7 @@ export class DestinationsController {
     constructor(private readonly destinationsService: DestinationsService) { }
 
     @Get('search')
-    @UseInterceptors(CacheInterceptor) // Auto cache the responses in Upstash Redis!
+    @UseInterceptors(CacheInterceptor)
     @CacheTTL(604800000) // Cache for 7 days (in milliseconds)
     async search(@Query('q') query: string) {
         if (!query) return [];
