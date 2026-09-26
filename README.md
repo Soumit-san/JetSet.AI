@@ -45,14 +45,14 @@ The application utilizes a stateless, high-availability architecture designed fo
 graph TD
     A[Vercel Frontend - Next.js/React] -->|API Requests| B[Hugging Face Space Backend - NestJS]
     B -->|Stateless Migrations & CRUD| C[Supabase PostgreSQL Database]
-    B -->|Fast Parallel Race| D[Grok & Groq API]
-    B -->|Fast Parallel Race| E[Google Gemini API]
-    B -->|ChromaDB / Local Vectors| F[RAG Travel Context Store]
+    B -->|Primary LLM| D[Groq API]
+    B -->|Fallback LLM & Embeddings| E[OpenRouter API]
+    B -->|Supabase pgvector / Local Vectors| F[RAG Travel Context Store]
     B -->|Travel Pricing & Imagery| G[SerpAPI Google Flights & Hotels]
 ```
 
 ### 1. Frontend
-* **Framework:** Next.js (App Router) & React 18
+* **Framework:** Next.js (App Router) & React 18/19
 * **Styling:** Vanilla CSS, Tailwind CSS for modular views, Glassmorphism panels
 * **State & Data Fetching:** TanStack React Query (`@tanstack/react-query`)
 * **Icons:** Lucide React
@@ -64,7 +64,7 @@ graph TD
 
 ### 3. Caching & Storage
 * **Primary DB:** Cloud Supabase PostgreSQL (Stateless; tables auto-initialize on boot)
-* **RAG Context Store:** Localized Vector Memory Index & ChromaDB
+* **RAG Context Store:** Supabase pgvector & Local Vector Memory Index
 
 ---
 

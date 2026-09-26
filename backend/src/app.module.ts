@@ -10,6 +10,7 @@ import { FlightsModule } from './flights/flights.module';
 import { HotelsModule } from './hotels/hotels.module';
 import { TripsModule } from './trips/trips.module';
 import { RagModule } from './rag/rag.module';
+import { OpenRouterModule } from './openrouter/openrouter.module';
 import { AiModule } from './ai/ai.module';
 import { CopilotModule } from './copilot/copilot.module';
 
@@ -18,6 +19,7 @@ import { CopilotModule } from './copilot/copilot.module';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    OpenRouterModule,
     DbModule,
     CacheModule.registerAsync({
       isGlobal: true,

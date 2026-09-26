@@ -97,9 +97,20 @@ export class FlightsService {
                 }
             }
 
-            try {
-                this.logger.log(`Fetching SerpAPI Google Flights: ${depIata} → ${arrIata} on ${travelDate}`);
+            // 'Any' stops = null (no restriction). Only map to 0 if user explicitly requests direct.
+            // IMPORTANT: Do NOT map 'Any' to direct-only. null means no stops restriction.
+            const directOnlyRequested = queryParams.directOnly === 'true';
+            const maxStopsParam = queryParams.maxStops;
+            const maxStopsFilter: number | null =
+                directOnlyRequested ? 0
+                : (maxStopsParam !== undefined && maxStopsParam !== null && maxStopsParam !== '')
+                    ? Number(maxStopsParam)
+                    : null; // null = Any = no restriction
 
+            try {
+                this.logger.log(`Flight search initiated: ${depIata} → ${arrIata} on ${travelDate} | directOnlyRequested: ${directOnlyRequested} | maxStopsFilter: ${maxStopsFilter ?? 'none (Any)'}`);
+
+                // Build SerpAPI params — never pass a stops restriction unless user explicitly requested direct-only
                 const params: Record<string, string> = {
                     engine: 'google_flights',
                     departure_id: depIata,
@@ -111,31 +122,72 @@ export class FlightsService {
                     api_key: serpApiKey,
                 };
 
-                const response = await firstValueFrom(
-                    this.httpService.get(this.serpApiBaseUrl, { params, timeout: 20000 })
-                );
+                // Only pass stops filter to SerpAPI if the user explicitly requested direct-only
+                if (directOnlyRequested) {
+                    params['stops'] = '1'; // SerpAPI: 1 = direct only
+                }
 
-                const apiData = response.data;
+                let allRawFlights = await this.callSerpApi(params, depIata, arrIata, travelDate);
 
-                // Combine best_flights and other_flights into one list
-                const allRawFlights: any[] = [
-                    ...(apiData.best_flights || []),
-                    ...(apiData.other_flights || []),
-                ];
+                // ── Zero-result fallback: retry with alternate hub airports ────────────
+                if (allRawFlights.length === 0 && !directOnlyRequested) {
+                    const altOrigins = this.getNearbyHubs(depIata);
+                    const altDests   = this.getNearbyHubs(arrIata);
 
-                this.logger.log(`SerpAPI returned ${allRawFlights.length} flight options (${(apiData.best_flights || []).length} best, ${(apiData.other_flights || []).length} other)`);
+                    // Try original dep → each alt dest
+                    for (const altArr of altDests) {
+                        if (allRawFlights.length > 0) break;
+                        this.logger.log(`Zero results for ${depIata}→${arrIata}. Retrying with alt destination: ${altArr}`);
+                        const altParams = { ...params, arrival_id: altArr };
+                        allRawFlights = await this.callSerpApi(altParams, depIata, altArr, travelDate);
+                    }
 
-                if (allRawFlights.length === 0) {
-                    this.logger.warn(`No flights found from SerpAPI for ${depIata} → ${arrIata}`);
+                    // Try each alt origin → original dest
+                    for (const altDep of altOrigins) {
+                        if (allRawFlights.length > 0) break;
+                        this.logger.log(`Zero results for ${depIata}→${arrIata}. Retrying with alt origin: ${altDep}`);
+                        const altParams = { ...params, departure_id: altDep };
+                        allRawFlights = await this.callSerpApi(altParams, altDep, arrIata, travelDate);
+                    }
+
+                    if (allRawFlights.length === 0) {
+                        this.logger.warn(`All fallback searches exhausted — no flights found for ${depIata}→${arrIata} on ${travelDate}.`);
+                        return {
+                            data: [],
+                            source: 'serpapi',
+                            message: `No flights found for ${depIata} → ${arrIata} on ${travelDate}. Try booking platforms directly.`,
+                        };
+                    }
+                } else if (allRawFlights.length === 0) {
+                    // direct-only with zero results — return empty, don't retry
                     return {
                         data: [],
                         source: 'serpapi',
-                        message: `No flights found on Google Flights for ${depIata} → ${arrIata} on ${travelDate}. Please check the date or try different airports.`
+                        message: `No direct flights found for ${depIata} → ${arrIata} on ${travelDate}. Connecting flights may be available — remove the direct-only filter.`,
                     };
                 }
 
                 // Map SerpAPI response to our internal format
                 let mappedFlights = allRawFlights.map((entry: any, idx: number) => this.mapSerpApiFlightEntry(entry, idx, depIata, arrIata, travelDate, currency));
+
+                // Apply stops filter ONLY if the user explicitly requested a specific max (not 'Any')
+                if (maxStopsFilter !== null) {
+                    const preCount = mappedFlights.length;
+                    mappedFlights = mappedFlights.filter(f => {
+                        const segs = f.itineraries?.[0]?.segments || [];
+                        const stops = segs.length > 0 ? segs.length - 1 : 0;
+                        return stops <= maxStopsFilter;
+                    });
+                    this.logger.log(`Stops filter applied (maxStops=${maxStopsFilter}): ${preCount} → ${mappedFlights.length} flights retained.`);
+
+                    // If filtering removes ALL results, return all unfiltered flights with a note
+                    if (mappedFlights.length === 0 && preCount > 0) {
+                        this.logger.warn(`Stops filter removed all results (maxStops=${maxStopsFilter}). Returning all ${preCount} unfiltered results for client-side display.`);
+                        mappedFlights = allRawFlights.map((entry: any, idx: number) => this.mapSerpApiFlightEntry(entry, idx, depIata, arrIata, travelDate, currency));
+                    }
+                } else {
+                    this.logger.log(`All ${mappedFlights.length} flight options retained (stops filter: Any / none)`);
+                }
 
                 // Perform backend scoring
                 mappedFlights = this.calculateBackendFlightScores(mappedFlights);
@@ -172,6 +224,73 @@ export class FlightsService {
         } finally {
             this.inFlightRequests.delete(cacheKey);
         }
+    }
+
+    /**
+     * Execute a single SerpAPI Google Flights request and return raw flight entries.
+     * Returns an empty array on any error or zero results.
+     */
+    private async callSerpApi(params: Record<string, string>, depIata: string, arrIata: string, travelDate: string): Promise<any[]> {
+        try {
+            const response = await firstValueFrom(
+                this.httpService.get(this.serpApiBaseUrl, { params, timeout: 20000 })
+            );
+            const apiData = response.data;
+            const all: any[] = [
+                ...(apiData.best_flights  || []),
+                ...(apiData.other_flights || []),
+            ];
+            this.logger.log(`SerpAPI [${depIata}→${arrIata} on ${travelDate}]: ${all.length} flights (best=${(apiData.best_flights||[]).length}, other=${(apiData.other_flights||[]).length})`);
+            return all;
+        } catch (err: any) {
+            this.logger.warn(`SerpAPI call failed for ${depIata}→${arrIata}: ${err.message}`);
+            return [];
+        }
+    }
+
+    /**
+     * Return known nearby/hub IATA alternatives for a given airport code.
+     * Used as fallback when a specific IATA returns zero results from SerpAPI.
+     */
+    private getNearbyHubs(iata: string): string[] {
+        const HUB_MAP: Record<string, string[]> = {
+            // India
+            'BBI': ['CCU', 'MAA', 'BOM', 'DEL'],
+            'CCU': ['BBI', 'BOM', 'DEL'],
+            'MAA': ['BOM', 'DEL', 'HYD'],
+            'HYD': ['MAA', 'BOM', 'DEL'],
+            'BLR': ['BOM', 'MAA', 'DEL'],
+            'COK': ['BOM', 'MAA'],
+            'IXC': ['DEL', 'ATQ'],
+            'ATQ': ['DEL', 'IXC'],
+            'JAI': ['DEL', 'BOM'],
+            'PNQ': ['BOM', 'DEL'],
+            'GOI': ['BOM', 'DEL'],
+            // Nepal / Regional
+            'KTM': ['DEL', 'CCU', 'BKK'],
+            'PKR': ['KTM'],
+            // South/SE Asia
+            'CMB': ['BOM', 'MAA', 'DEL'],
+            'DAC': ['CCU', 'DEL'],
+            'BKK': ['SIN', 'KUL', 'HKG'],
+            'SIN': ['KUL', 'CGK', 'BKK'],
+            'KUL': ['SIN', 'BKK'],
+            // Europe
+            'LTN': ['LHR', 'LGW', 'STN'],
+            'LGW': ['LHR', 'LTN', 'STN'],
+            'CDG': ['ORY', 'BVA'],
+            'BER': ['HAM', 'MUC', 'FRA'],
+            'MXP': ['LIN', 'FCO', 'VCE'],
+            // Middle East
+            'SHJ': ['DXB', 'AUH'],
+            'AUH': ['DXB', 'SHJ'],
+            // US
+            'EWR': ['JFK', 'LGA'],
+            'LGA': ['JFK', 'EWR'],
+            'SFO': ['OAK', 'SJC'],
+            'OAK': ['SFO', 'SJC'],
+        };
+        return HUB_MAP[iata] || [];
     }
 
     /**

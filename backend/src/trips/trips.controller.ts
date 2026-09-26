@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, Param, Inject, forwardRef } from '@nestjs/common';
+import { Controller, Post, Get, Patch, Body, Param, Inject, forwardRef } from '@nestjs/common';
 import { TripsService, TripData } from './trips.service';
 import { AiService } from '../ai/ai.service';
 
@@ -19,17 +19,23 @@ export class TripsController {
     return await this.tripsService.getTrip(id);
   }
 
+  @Patch(':id')
+  async modifyTrip(@Param('id') id: string, @Body() updates: Partial<TripData>) {
+    return await this.tripsService.modifyTrip(id, updates, this.aiService);
+  }
+
   /**
    * GET /trips/:id/itinerary-stops
-   * Uses Gemini AI to parse the trip's combinedPlan and extract per-city stays
-   * with checkin/checkout dates. Falls back to regex if Gemini unavailable.
+   * Uses AI to parse the trip's combinedPlan and extract per-city stays
+   * with checkin/checkout dates. Falls back to regex if AI is unavailable.
    */
   @Get(':id/itinerary-stops')
   async getItineraryStops(@Param('id') id: string) {
     const trip = await this.tripsService.getTrip(id);
 
     if (!trip.combinedPlan) {
-      return { status: 'pending', stops: [] };
+      const fallback = this.aiService.buildFallbackStop(trip.destination, trip.fromDate, trip.toDate);
+      return { status: 'ready', stops: fallback };
     }
 
     const stops = await this.aiService.extractItineraryStops(
@@ -39,12 +45,15 @@ export class TripsController {
       trip.destination,
     );
 
-    return { status: 'ready', stops };
+    return {
+      status: 'ready',
+      stops: stops && stops.length > 0 ? stops : this.aiService.buildFallbackStop(trip.destination, trip.fromDate, trip.toDate),
+    };
   }
 
   /**
    * GET /trips/:id/flight-legs
-   * Uses Gemini AI to determine ONLY the commercially flyable legs.
+   * Uses AI to determine ONLY the commercially flyable legs.
    * AI knows which parts are road/trek/local transport and which need airline tickets.
    * Handles hub routing (e.g., BBI→DEL→KTM) if no direct flight exists.
    */
@@ -53,10 +62,13 @@ export class TripsController {
     const trip = await this.tripsService.getTrip(id);
 
     if (!trip.combinedPlan) {
-      return { status: 'pending', legs: null };
+      // Even if AI combined plan is still streaming/generating, immediately provide deterministic flight legs
+      // based on trip origin/destination/dates so the user can view commercial flights right away.
+      const fallback = this.aiService.fallbackFlightLegs(trip);
+      return { status: 'ready', legs: fallback };
     }
 
-    const legs = await this.aiService.extractFlightLegs({
+    let legs = await this.aiService.extractFlightLegs({
       origin:       trip.origin,
       destination:  trip.destination,
       fromDate:     trip.fromDate,
@@ -67,12 +79,16 @@ export class TripsController {
       combinedPlan: trip.combinedPlan,
     });
 
+    if (!legs || !legs.outbound || legs.outbound.length === 0) {
+      legs = this.aiService.fallbackFlightLegs(trip);
+    }
+
     return { status: 'ready', legs };
   }
 
   /**
    * GET /trips/:id/warning
-   * Checks destination restricted permissions/season closures using Gemini
+   * Checks destination restricted permissions/season closures using AI
    */
   @Get(':id/warning')
   async getTripWarning(@Param('id') id: string) {

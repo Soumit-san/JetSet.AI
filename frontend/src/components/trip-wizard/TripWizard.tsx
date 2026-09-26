@@ -14,6 +14,7 @@ import Step2Dates from "./Step2Dates";
 import Step3Preferences from "./Step3Preferences";
 import { Loader2 } from "lucide-react";
 import { getApiUrl } from "@/utils/api";
+import { formatLocalDateToYMD, formatDisplayDates } from "@/lib/dateUtils";
 
 // Define the form schema
 export const tripFormSchema = z.object({
@@ -80,8 +81,8 @@ export default function TripWizard() {
     const onSubmit = async (data: TripFormValues) => {
         setIsSubmitting(true);
         try {
-            const fromDateStr = data.dateRange.from ? data.dateRange.from.toISOString().split("T")[0] : "";
-            const toDateStr = data.dateRange.to ? data.dateRange.to.toISOString().split("T")[0] : "";
+            const fromDateStr = formatLocalDateToYMD(data.dateRange?.from);
+            const toDateStr = formatLocalDateToYMD(data.dateRange?.to);
 
             const baseUrl = getApiUrl();
             const response = await fetch(`${baseUrl}/trips`, {
@@ -110,11 +111,9 @@ export default function TripWizard() {
             const orgParam = encodeURIComponent(data.origin);
             const destParam = encodeURIComponent(data.destination);
 
-            const displayDates = data.dateRange?.from
-                ? `${data.dateRange.from.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${data.dateRange.to ? data.dateRange.to.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : ''}`
-                : '';
+            const displayDates = formatDisplayDates(fromDateStr, toDateStr);
 
-            const exactDates = data.dateRange?.from
+            const exactDates = fromDateStr
                 ? `${fromDateStr}${toDateStr ? '_' + toDateStr : ''}`
                 : '';
 

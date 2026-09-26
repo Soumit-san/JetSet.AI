@@ -14,6 +14,7 @@ import { useUserCurrency } from "@/hooks/useUserCurrency";
 import { FlightCard } from "@/components/flights/FlightCard";
 import { FlightFilters, SortOption } from "@/components/flights/FlightFilters";
 import { compareFlights } from "@/utils/flight-utils";
+import { formatSingleDisplayDate, parseYMD } from "@/lib/dateUtils";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,20 +45,25 @@ interface LegState {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const fmtDisplay = (iso: string): string => {
-    if (!iso) return "";
-    const d = new Date(iso);
-    return isNaN(d.getTime()) ? iso : d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+    return formatSingleDisplayDate(iso, "day-month");
 };
 
 // ─── Booking Links ────────────────────────────────────────────────────────────
 
 function DirectBookingLinks({ orgCode, destCode, travelDate }: { orgCode: string; destCode: string; travelDate: string }) {
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    let bookDate = travelDate ? new Date(travelDate) : new Date(today.getTime() + 7 * 86400000);
-    if (isNaN(bookDate.getTime()) || bookDate <= today) bookDate = new Date(today.getTime() + 7 * 86400000);
-    const y = bookDate.getFullYear();
-    const m = String(bookDate.getMonth() + 1).padStart(2, "0");
-    const d = String(bookDate.getDate()).padStart(2, "0");
+    let y: string, m: string, d: string;
+    const p = parseYMD(travelDate);
+    if (p) {
+        y = String(p.year);
+        m = String(p.month).padStart(2, "0");
+        d = String(p.day).padStart(2, "0");
+    } else {
+        const today = new Date();
+        const fallback = new Date(today.getTime() + 7 * 86400000);
+        y = String(fallback.getFullYear());
+        m = String(fallback.getMonth() + 1).padStart(2, "0");
+        d = String(fallback.getDate()).padStart(2, "0");
+    }
 
     const links = [
         { name: "MakeMyTrip", url: `https://www.makemytrip.com/flight/search?itinerary=${orgCode}-${destCode}-${d}/${m}/${y}&tripType=O&paxType=A-1_C-0_I-0&intl=true&cabinClass=E` },
@@ -317,11 +323,36 @@ export default function FlightsModule({ tripId, org, dest, dates, curr }: Module
                         sorted.sort((a, b) => compareFlights(a, b, sortBy));
 
                         if (sorted.length === 0) {
+                            if (maxStops === 0 && activeState.flights.length > 0) {
+                                return (
+                                    <div className="space-y-4">
+                                        <div className="glass-panel p-5 rounded-xl border border-sky-500/20 bg-sky-500/5 text-center">
+                                            <p className="text-white font-medium text-sm mb-1">
+                                                No direct flights found for <strong className="text-sky-300">{activeLeg.fromIata} → {activeLeg.toIata}</strong>
+                                            </p>
+                                            <p className="text-white/60 text-xs mb-3">
+                                                Valid 1-stop and connecting flights are available for this route ({activeState.flights.length} options found).
+                                            </p>
+                                            <button
+                                                onClick={() => setMaxStops(null)}
+                                                className="px-4 py-2 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 text-xs font-semibold transition-all shadow-md cursor-pointer"
+                                            >
+                                                Show All {activeState.flights.length} Available Flights
+                                            </button>
+                                        </div>
+                                        <div className="flex items-center justify-center gap-2 pt-1 border-t border-white/5">
+                                            <span className="text-[10px] text-white/30 font-medium">Or compare on external platforms:</span>
+                                            <DirectBookingLinks orgCode={activeLeg.fromIata} destCode={activeLeg.toIata} travelDate={activeLeg.date} />
+                                        </div>
+                                    </div>
+                                );
+                            }
+
                             return (
                                 <div className="glass-panel p-5 rounded-xl border border-white/5 text-center">
                                     <Search className="w-7 h-7 text-white/20 mx-auto mb-2" />
                                     <p className="text-white/60 text-sm mb-1">
-                                        No direct flights found for <strong className="text-white/80">{activeLeg.fromIata} → {activeLeg.toIata}</strong>
+                                        No commercial flights currently found for <strong className="text-white/80">{activeLeg.fromIata} → {activeLeg.toIata}</strong> on {fmtDisplay(activeLeg.date)}
                                     </p>
                                     <p className="text-white/30 text-xs mb-2">Compare on booking platforms directly:</p>
                                     <DirectBookingLinks orgCode={activeLeg.fromIata} destCode={activeLeg.toIata} travelDate={activeLeg.date} />

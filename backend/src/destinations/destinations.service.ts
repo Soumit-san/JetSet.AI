@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
 import * as fs from 'fs';
 import * as path from 'path';
+import { OpenRouterService } from '../openrouter/openrouter.service';
 
 @Injectable()
 export class DestinationsService {
@@ -13,6 +14,7 @@ export class DestinationsService {
     constructor(
         private readonly httpService: HttpService,
         private readonly configService: ConfigService,
+        private readonly openRouterService: OpenRouterService,
     ) { }
 
     private ensureCacheFileExists() {
@@ -166,48 +168,36 @@ export class DestinationsService {
             return cache[cacheKey];
         }
 
-        const apiKey = this.configService.get<string>('GEMINI_API_KEY');
-        if (!apiKey) {
-            this.logger.warn('GEMINI_API_KEY is not configured. Returning generic fallback.');
+        if (!this.openRouterService.hasKey) {
+            this.logger.warn('OPENROUTER_API_KEY is not configured. Returning generic fallback.');
             return this.getGenericFallback(cleanLocation);
         }
 
         const prompt = `Identify the nearest major commercial airport with a 3-letter IATA code for the following location: "${cleanLocation}".
 Return ONLY the 3-letter IATA code in uppercase. Do not include any other text, explanation, or punctuation. Example: CDG`;
 
-        const models = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
-        for (const model of models) {
-            try {
-                this.logger.log(`Resolving nearest airport for "${cleanLocation}" via Google Gemini (${model})`);
-                const response = await firstValueFrom(
-                    this.httpService.post(
-                        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-                        { contents: [{ parts: [{ text: prompt }] }] },
-                        { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
-                    )
-                );
+        try {
+            this.logger.log(`Resolving nearest airport for "${cleanLocation}" via OpenRouter`);
+            const text = await this.openRouterService.chatCompletion({
+                messages: [
+                    { role: 'system', content: 'You are an airport IATA code resolver. Respond ONLY with the 3-letter IATA code in uppercase.' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.1,
+            });
 
-                const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-                this.logger.log(`Gemini (${model}) response for airport resolution of ${cleanLocation}: ${text}`);
+            this.logger.log(`OpenRouter response for airport resolution of ${cleanLocation}: ${text}`);
 
-                const match = text?.match(/\b([A-Z]{3})\b/);
-                if (match) {
-                    const iata = match[1];
-                    this.writeCache(cacheKey, iata);
-                    return iata;
-                }
-            } catch (error: any) {
-                const status = error?.response?.status || 0;
-                if (status === 429 || status === 503) {
-                    this.logger.warn(`Rate limit (${status}) on model ${model} for ${cleanLocation}, trying next model...`);
-                    await new Promise(r => setTimeout(r, 1000));
-                    continue;
-                }
-                this.logger.error(`Failed to resolve airport IATA for ${cleanLocation}: ${error.message}`);
-                return this.getGenericFallback(cleanLocation);
+            const match = text?.match(/\b([A-Z]{3})\b/);
+            if (match) {
+                const iata = match[1];
+                this.writeCache(cacheKey, iata);
+                return iata;
             }
+        } catch (error: any) {
+            this.logger.error(`Failed to resolve airport IATA for ${cleanLocation} via OpenRouter: ${error.message}`);
         }
-        this.logger.error(`All Gemini models exhausted for airport resolution of ${cleanLocation}. Returning generic fallback.`);
+
         return this.getGenericFallback(cleanLocation);
     }
 
@@ -415,8 +405,7 @@ Return ONLY the 3-letter IATA code in uppercase. Do not include any other text, 
             return { isValid: true };
         }
 
-        const apiKey = this.configService.get<string>('GEMINI_API_KEY');
-        if (!apiKey) {
+        if (!this.openRouterService.hasKey) {
             // If no API key, check if standard string is obviously fake
             const fakePlanets = ['moon', 'mars', 'jupiter', 'saturn', 'venus', 'mercury', 'neptune', 'uranus', 'pluto', 'sun', 'galaxy', 'universe'];
             const isPlanet = fakePlanets.some(p => clean.includes(p));
@@ -436,15 +425,16 @@ Return ONLY valid JSON matching this schema (no markdown, no explanations):
 }
 `;
 
-            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+            const text = await this.openRouterService.chatCompletion({
+                messages: [
+                    { role: 'system', content: 'You are a geolocation validity analyzer. Output strictly JSON.' },
+                    { role: 'user', content: prompt }
+                ],
+                expectJson: true,
+                temperature: 0.1,
             });
 
-            if (res.ok) {
-                const data = await res.json();
-                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            if (text) {
                 const cleanJson = text.replace(/```json/g, '').replace(/```/g, '').trim();
                 const parsed = JSON.parse(cleanJson);
                 if (parsed.isValid && parsed.isCountry && parsed.capitalCity) {
@@ -453,10 +443,10 @@ Return ONLY valid JSON matching this schema (no markdown, no explanations):
                 return { isValid: !!parsed.isValid };
             }
         } catch (e: any) {
-            this.logger.error(`Error validating destination on Earth: ${e.message}`);
+            this.logger.error(`Error validating destination on Earth via OpenRouter: ${e.message}`);
         }
 
-        // Default to true if Gemini fails to avoid blocking users on network errors
+        // Default to true if OpenRouter fails to avoid blocking users on network errors
         return { isValid: true };
     }
 }

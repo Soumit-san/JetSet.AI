@@ -37,7 +37,7 @@ const getSuggestedQuestions = (route: string, view: string) => {
 };
 
 export function CopilotSheet() {
-  const { isOpen, setIsOpen, messages, addMessage, activeRoute, activeView, draftSelections, setIsStreaming } = useCopilotStore();
+  const { isOpen, setIsOpen, messages, addMessage, activeRoute, activeView, draftSelections, setIsStreaming, tripId } = useCopilotStore();
   const { jettyState } = useJettyState();
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -63,15 +63,28 @@ export function CopilotSheet() {
     const token = localStorage.getItem('token') || 'dummy-token-for-now';
     const conversation = [...messages, userMsg];
 
-    let currentAssistantMsg: CopilotMessage = { role: 'assistant', content: '' };
-    addMessage(currentAssistantMsg); 
-    
+    let currentAssistantContent = '';
+    let assistantAdded = false;
+
     const updateLastMessage = (content: string) => {
       useCopilotStore.setState((state) => {
         const newMsgs = [...state.messages];
-        newMsgs[newMsgs.length - 1] = { ...newMsgs[newMsgs.length - 1], content };
+        if (newMsgs.length > 0 && newMsgs[newMsgs.length - 1].role === 'assistant') {
+          newMsgs[newMsgs.length - 1] = { ...newMsgs[newMsgs.length - 1], content };
+        }
         return { messages: newMsgs };
       });
+    };
+
+    const appendContent = (chunk: string) => {
+      currentAssistantContent += chunk;
+      if (!assistantAdded) {
+        setIsTyping(false); // Stop thinking spinner once content starts
+        addMessage({ role: 'assistant', content: currentAssistantContent });
+        assistantAdded = true;
+      } else {
+        updateLastMessage(currentAssistantContent);
+      }
     };
 
     try {
@@ -84,6 +97,7 @@ export function CopilotSheet() {
         },
         body: JSON.stringify({
           messages: conversation,
+          tripId: tripId || undefined,
           context: JSON.stringify({
             activeRoute,
             activeView,
@@ -99,14 +113,26 @@ export function CopilotSheet() {
               return;
             }
             if (payload.error) {
-              updateLastMessage(`Error: ${payload.error}`);
               setIsTyping(false);
               setIsStreaming(false);
+              appendContent(`Error: ${payload.error}`);
               return;
             }
             if (payload.content) {
-              currentAssistantMsg.content += payload.content;
-              updateLastMessage(currentAssistantMsg.content);
+              appendContent(payload.content);
+            }
+            if (payload.itineraryUpdated && payload.updatedItinerary) {
+              window.dispatchEvent(new CustomEvent('copilot-itinerary-updated', {
+                detail: { updatedItinerary: payload.updatedItinerary, tripId }
+              }));
+              setTimeout(() => {
+                window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'itinerary' }));
+              }, 300);
+            }
+            if (payload.tripUpdated && payload.updatedTrip) {
+              window.dispatchEvent(new CustomEvent('copilot-trip-updated', {
+                detail: payload.updatedTrip
+              }));
             }
             if (payload.toolCalls) {
                const tool = payload.toolCalls[0];
@@ -114,16 +140,31 @@ export function CopilotSheet() {
                  const args = JSON.parse(tool.function.arguments);
                  if (args.path) {
                    router.push(args.path);
-                   updateLastMessage(currentAssistantMsg.content + `\n\n*Navigating to ${args.path}...*`);
+                   appendContent(`\n\n*Navigating to ${args.path}...*`);
                  }
                } else if (tool.function.name === 'switch_tab') {
                  const args = JSON.parse(tool.function.arguments);
                  if (args.tabId) {
                    window.dispatchEvent(new CustomEvent('switch-tab', { detail: args.tabId }));
-                   updateLastMessage(currentAssistantMsg.content + `\n\n*Opening ${args.tabId}...*`);
+                   appendContent(`\n\n*Opening ${args.tabId} tab...*`);
                  }
+               } else if (tool.function.name === 'modify_trip') {
+                 const args = JSON.parse(tool.function.arguments);
+                 // Dispatch a custom event so the results page can update URL params / trip state
+                 window.dispatchEvent(new CustomEvent('copilot-modify-trip', { detail: args }));
+                 // Switch to the most relevant tab after modification
+                 if (args.fromDate || args.toDate) {
+                   setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'flights' })), 800);
+                 } else if (args.budget || args.companions) {
+                   setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'hotels' })), 800);
+                 }
+               } else if (tool.function.name === 'edit_itinerary') {
+                 const args = JSON.parse(tool.function.arguments);
+                 // Dispatch event so ItineraryModule can pick up the edit instruction
+                 window.dispatchEvent(new CustomEvent('copilot-edit-itinerary', { detail: args }));
+                 setTimeout(() => window.dispatchEvent(new CustomEvent('switch-tab', { detail: 'itinerary' })), 600);
                } else {
-                 updateLastMessage(currentAssistantMsg.content + ` [Executing Tool: ${tool.function.name}]`);
+                 appendContent(` [Executing Tool: ${tool.function.name}]`);
                }
             }
           } catch (e) {
@@ -200,32 +241,35 @@ export function CopilotSheet() {
             </div>
           ) : (
             <div className="space-y-4">
-              {messages.map((m, i) => (
-                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start items-end gap-2'}`}>
-                  {m.role === 'assistant' && (
-                    <JettyMascot 
-                      state={i === messages.length - 1 ? jettyState : 'idle'} 
-                      size="small" 
-                      className="mb-1 shrink-0" 
-                    />
-                  )}
-                  <div className={`p-4 rounded-2xl max-w-[85%] shadow-sm ${
-                    m.role === 'user' 
-                      ? 'bg-sky-600 text-white rounded-br-sm' 
-                      : 'bg-muted text-foreground rounded-bl-sm border border-border'
-                  }`}>
-                    {m.role === 'assistant' ? (
-                      <div className="prose prose-sm dark:prose-invert max-w-none text-foreground select-text">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {m.content}
-                        </ReactMarkdown>
-                      </div>
-                    ) : (
-                      m.content
+              {messages.map((m, i) => {
+                if (m.role === 'assistant' && !m.content.trim()) return null;
+                return (
+                  <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start items-end gap-2'}`}>
+                    {m.role === 'assistant' && (
+                      <JettyMascot 
+                        state={i === messages.length - 1 ? jettyState : 'idle'} 
+                        size="small" 
+                        className="mb-1 shrink-0" 
+                      />
                     )}
+                    <div className={`p-4 rounded-2xl max-w-[85%] shadow-sm ${
+                      m.role === 'user' 
+                        ? 'bg-sky-600 text-white rounded-br-sm' 
+                        : 'bg-muted text-foreground rounded-bl-sm border border-border'
+                    }`}>
+                      {m.role === 'assistant' ? (
+                        <div className="prose prose-sm dark:prose-invert max-w-none text-foreground select-text">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {m.content}
+                          </ReactMarkdown>
+                        </div>
+                      ) : (
+                        m.content
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               {isTyping && (
                 <div className="flex justify-start items-end gap-2">
                   <JettyMascot state={jettyState} size="small" className="mb-1 shrink-0" />

@@ -61,6 +61,31 @@ export default function ItineraryModule({ tripId, org, dest, dates }: ModuleProp
         fetchItinerary();
     }, [tripId]);
 
+    // Listen for real-time Copilot itinerary updates
+    useEffect(() => {
+        const handleItineraryUpdated = (e: Event) => {
+            const customEvent = e as CustomEvent;
+            const updated = customEvent.detail?.updatedItinerary;
+            if (updated) {
+                setItinerary(updated);
+                setIsLoading(false);
+                setError("");
+                const newDays = parseItinerary(updated);
+                setExpandedDays(prev => {
+                    const next = new Set(prev);
+                    newDays.forEach(d => next.add(d.day));
+                    return next;
+                });
+            } else {
+                fetchedRef.current = false;
+                fetchItinerary();
+            }
+        };
+
+        window.addEventListener("copilot-itinerary-updated", handleItineraryUpdated);
+        return () => window.removeEventListener("copilot-itinerary-updated", handleItineraryUpdated);
+    }, []);
+
     const fetchItinerary = async () => {
         setIsLoading(true);
         setError("");

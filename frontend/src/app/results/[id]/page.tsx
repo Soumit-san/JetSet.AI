@@ -24,39 +24,9 @@ export default async function ResultsPage({
             <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-sky-deep/10 blur-[120px] pointer-events-none" />
             <div className="absolute top-[40%] right-[-10%] w-[30%] h-[30%] rounded-full bg-violet-600/10 blur-[120px] pointer-events-none" />
 
-            <div className="w-full max-w-6xl z-10 space-y-8">
-                {/* Header Area */}
-                <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 glass-panel p-6 md:p-8 rounded-2xl">
-                    <div>
-                        <h1 className="text-3xl md:text-5xl font-display font-bold text-white tracking-tight select-none pointer-events-none">
-                            Your <span className="text-sky-vivid">Trip Blueprint</span>
-                        </h1>
-                        <p className="text-white/70 mt-2 font-sans flex items-center gap-2">
-                            <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]" />
-                            AI is finalizing the smartest routes and best deals.
-                        </p>
-                    </div>
-
-                    <div className="flex gap-4">
-                        <div className="text-right">
-                            <p className="text-white/50 text-xs font-mono uppercase tracking-wider">Origin</p>
-                            <p className="text-white font-medium text-lg">{org}</p>
-                        </div>
-                        <div className="w-px bg-white/10" />
-                        <div className="text-center">
-                            <p className="text-white/50 text-xs font-mono uppercase tracking-wider">Destination</p>
-                            <p className="text-white font-medium text-lg">{dest}</p>
-                        </div>
-                        <div className="w-px bg-white/10" />
-                        <div className="text-left">
-                            <p className="text-white/50 text-xs font-mono uppercase tracking-wider">Dates</p>
-                            <p className="text-white font-medium text-lg">{displayDates}</p>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Dashboard Client Component */}
-                <ResultsDashboard tripId={tripId} org={org} dest={dest} dates={dates} curr={curr} />
+            <div className="w-full max-w-6xl z-10">
+                {/* Dashboard Client Component with Canonical Trip Blueprint Header */}
+                <ResultsDashboard tripId={tripId} org={org} dest={dest} dates={dates} displayDates={displayDates} curr={curr} />
             </div>
         </main>
     );

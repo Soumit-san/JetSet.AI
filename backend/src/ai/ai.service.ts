@@ -5,6 +5,7 @@ import type { Cache } from 'cache-manager';
 import { TripsService } from '../trips/trips.service';
 import { RagService } from '../rag/rag.service';
 import { normalizeAndHash } from '../common/normalize';
+import { OpenRouterService, OpenRouterMessage } from '../openrouter/openrouter.service';
 
 export interface ItineraryStopDto {
   city: string;
@@ -102,12 +103,11 @@ export class AiService {
     private readonly configService: ConfigService,
     private readonly tripsService: TripsService,
     private readonly ragService: RagService,
+    private readonly openRouterService: OpenRouterService,
     @Inject(CACHE_MANAGER) private cacheManager: Cache,
   ) {
-    const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
-    if (geminiKey && geminiKey.trim() !== '') {
-      this.hasApiKey = true;
-      this.logger.log('Google Gemini API initialized for AiService');
+    if (this.openRouterService.hasKey) {
+      this.logger.log(`OpenRouter API initialized for AiService (Model: ${this.openRouterService.getModel()})`);
     }
     const grokKey = this.configService.get<string>('GROK_API_KEY');
     if (grokKey && grokKey.trim() !== '') {
@@ -121,7 +121,7 @@ export class AiService {
     if (key.startsWith('gsk_')) {
       return {
         url: 'https://api.groq.com/openai/v1/chat/completions',
-        model: 'openai/gpt-oss-20b',
+        model: 'openai/gpt-oss-120b',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${key}`,
@@ -143,7 +143,9 @@ export class AiService {
   private grokCircuitOpen = false;
   private grokCircuitOpenAt = 0;
   private readonly GROK_COOLDOWN_MS = 30_000; // 30 s
-  private readonly AI_REQUEST_TIMEOUT_MS = 12_000; // 12 s per provider
+  private readonly AI_REQUEST_TIMEOUT_MS = 15_000;         // 15 s – Groq connection timeout
+  private readonly OPENROUTER_FALLBACK_TIMEOUT_MS = 60_000; // 60 s – free models can be slow
+  private readonly GROK_STREAM_READ_TIMEOUT_MS = 45_000;   // 45 s – max time for a Groq SSE stream
 
   /** Returns true when Grok should be skipped due to recent failures. */
   private isGrokCircuitOpen(): boolean {
@@ -179,79 +181,17 @@ export class AiService {
     expectJson = false,
   ): Promise<string> {
     const grokKey = this.configService.get<string>('GROK_API_KEY');
-    const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
-
     const hasGrok = !!(grokKey && grokKey.trim());
-    const hasGemini = !!(geminiKey && geminiKey.trim());
+    const hasOpenRouter = this.openRouterService.hasKey;
 
-    if (!hasGrok && !hasGemini) {
-      throw new Error('No AI credentials available (both Gemini and Grok/Groq keys are missing)');
+    if (!hasGrok && !hasOpenRouter) {
+      throw new Error('No AI credentials available (both Groq and OpenRouter keys are missing)');
     }
 
-    // ── Fast path: if both providers available AND Grok circuit is closed, race them ──
-    if (hasGrok && hasGemini && !this.isGrokCircuitOpen()) {
-      const config = this.getGrokConfig();
-      const grokBody: any = {
-        model: config.model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: prompt }
-        ]
-      };
-      if (expectJson) grokBody.response_format = { type: 'json_object' };
+    // Sequential path: always try Groq first. Only use OpenRouter if Groq fails or circuit is open.
+    // IMPORTANT: We must NOT race providers — OpenRouter is a rate-limited fallback (50 req/day free tier).
 
-      const geminiBody: any = {
-        contents: [{ parts: [{ text: prompt }] }],
-        systemInstruction: { parts: [{ text: systemPrompt }] }
-      };
-      if (expectJson) geminiBody.generationConfig = { responseMimeType: 'application/json' };
-
-      // Race both providers — whichever replies first wins
-      const grokPromise = this.withTimeout(
-        fetch(config.url, { method: 'POST', headers: config.headers, body: JSON.stringify(grokBody) })
-          .then(async (res) => {
-            if (!res.ok) throw new Error(`Grok status ${res.status}`);
-            const d = await res.json();
-            const c = d.choices?.[0]?.message?.content;
-            if (!c?.trim()) throw new Error('Grok returned empty content');
-            return { source: 'grok' as const, text: c };
-          }),
-        this.AI_REQUEST_TIMEOUT_MS,
-        'Grok'
-      );
-
-      const geminiPromise = this.withTimeout(
-        fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${geminiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(geminiBody)
-        }).then(async (res) => {
-          if (!res.ok) throw new Error(`Gemini status ${res.status}`);
-          const d = await res.json();
-          const t = d.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (!t?.trim()) throw new Error('Gemini returned empty content');
-          return { source: 'gemini' as const, text: t };
-        }),
-        this.AI_REQUEST_TIMEOUT_MS,
-        'Gemini'
-      );
-
-      try {
-        // Promise.any → first successful response wins
-        const winner = await Promise.any([grokPromise, geminiPromise]);
-        this.logger.log(`callModelWithFallback: ${winner.source} responded first`);
-        if (winner.source === 'gemini') {
-          // Grok was slower/failed — open circuit so next calls skip it immediately
-          this.tripGrokCircuit('Grok was slower than Gemini in race');
-        }
-        return winner.text;
-      } catch {
-        // Both failed in race — fall through to sequential below
-        this.tripGrokCircuit('Both providers failed in race');
-      }
-    }
-
-    // ── Slow path: try providers sequentially with timeouts ──
+    // Slow path: try Groq then OpenRouter
     if (hasGrok && !this.isGrokCircuitOpen()) {
       try {
         const config = this.getGrokConfig();
@@ -264,7 +204,7 @@ export class AiService {
         };
         if (expectJson) body.response_format = { type: 'json_object' };
 
-        this.logger.log(`callModelWithFallback: trying Grok (${config.model})...`);
+        this.logger.log(`callModelWithFallback: trying Groq (${config.model})...`);
         const res = await this.withTimeout(
           fetch(config.url, { method: 'POST', headers: config.headers, body: JSON.stringify(body) }),
           this.AI_REQUEST_TIMEOUT_MS,
@@ -280,40 +220,32 @@ export class AiService {
         }
       } catch (e: any) {
         this.tripGrokCircuit(e.message);
-        this.logger.warn(`Grok failed: ${e.message} — switching to Gemini...`);
+        this.logger.warn(`Grok failed: ${e.message} — switching to OpenRouter...`);
       }
     }
 
-    if (!hasGemini) throw new Error('Gemini key not configured and Grok failed');
-
-    // Use only the fast flash-lite model; 2.5-flash is slower and not needed for simple tasks
-    try {
-      this.logger.log('callModelWithFallback: using Gemini fallback...');
-      const body: any = {
-        contents: [{ parts: [{ text: prompt }] }],
-        systemInstruction: { parts: [{ text: systemPrompt }] }
-      };
-      if (expectJson) body.generationConfig = { responseMimeType: 'application/json' };
-
-      const res = await this.withTimeout(
-        fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${geminiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        }),
-        this.AI_REQUEST_TIMEOUT_MS,
-        'Gemini'
-      );
-      if (res.ok) {
-        const data = await res.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text?.trim()) return text;
+    if (hasOpenRouter) {
+      try {
+        this.logger.log(`callModelWithFallback: using OpenRouter fallback (${this.openRouterService.getModel()})...`);
+        // Free-tier OpenRouter models can take 30-60s to respond — use a generous timeout.
+        const content = await this.withTimeout(
+          this.openRouterService.chatCompletion({
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: prompt }
+            ],
+            expectJson,
+          }),
+          this.OPENROUTER_FALLBACK_TIMEOUT_MS,
+          'OpenRouter'
+        );
+        if (content?.trim()) return content;
+      } catch (e: any) {
+        this.logger.error(`OpenRouter fallback failed: ${e.message}`);
       }
-    } catch (e: any) {
-      this.logger.error(`Gemini fallback failed: ${e.message}`);
     }
 
-    throw new Error('All model generation attempts failed');
+    throw new Error('All AI generation attempts failed (Groq and OpenRouter)');
   }
 
   async getSummaryStream(tripId: string, onChunk: (text: string) => void, onComplete: () => void) {
@@ -336,9 +268,20 @@ export class AiService {
     // Check if combined plan is cached
     if (trip.combinedPlan) {
       const summaryText = this.extractSection(trip.combinedPlan, 'summary');
-      await this.streamString(summaryText, onChunk);
-      onComplete();
-      return;
+      const hasPerDayOnly = summaryText.includes('Total Per Day') || (!summaryText.includes('Flights') && !summaryText.includes('International Flights') && !summaryText.includes('Domestic Transport'));
+      if (summaryText && summaryText.trim() && !hasPerDayOnly) {
+        await this.streamString(summaryText, onChunk);
+        onComplete();
+        return;
+      }
+      if (hasPerDayOnly) {
+        this.logger.log(`Trip ${tripId}: cached plan has legacy per-day budget, regenerating with full-trip budget.`);
+        try {
+          await this.tripsService.updateTrip(tripId, { combinedPlan: '' });
+        } catch (e: any) {
+          this.logger.warn(`Could not clear stale cache for trip ${tripId}: ${e.message}`);
+        }
+      }
     }
 
     const ragContext = await this.ragService.retrieveContext(trip.destination, 3);
@@ -346,14 +289,14 @@ export class AiService {
       ? ragContext.join('\n\n')
       : 'No travel document context found in library. Use general knowledge.';
 
-    let geminiSucceeded = false;
+    let planSucceeded = false;
     try {
       const streamer = new SectionStreamer('---SUMMARY_START---', '---SUMMARY_END---', onChunk);
       const fullResponse = await this.callCombinedPlanGenerationStream(trip, contextString, (chunk) => {
         streamer.push(chunk);
       });
       streamer.flush();
-      geminiSucceeded = true;
+      planSucceeded = true;
 
       // Try to cache — but don't let cache failure break the response
       try {
@@ -364,12 +307,12 @@ export class AiService {
       onComplete();
     } catch (error: any) {
       this.logger.error(`Failed to stream summary combined plan: ${error.message}`);
-      if (!geminiSucceeded) {
-        const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
+      if (!planSucceeded) {
+        const openrouterKey = this.configService.get<string>('OPENROUTER_API_KEY');
         const grokKey = this.configService.get<string>('GROK_API_KEY');
         let reason = 'The AI model quota limits have been temporarily exceeded or the API services returned a rate limit error (429).';
-        if (!geminiKey && !grokKey) {
-          reason = 'Both GEMINI_API_KEY and GROK_API_KEY are missing from the backend configuration.';
+        if (!openrouterKey && !grokKey) {
+          reason = 'Both OPENROUTER_API_KEY and GROK_API_KEY are missing from the backend configuration.';
         }
         const apology = `
 > ### 🌍 A Gentle Apology from JetSet.AI
@@ -377,7 +320,7 @@ export class AiService {
 > We are sincerely sorry, but our intelligent planning assistant is currently unable to generate a fresh custom plan.
 > **Reason:** ${reason}
 > 
-> * **For Developers:** Please check and verify that your \`GEMINI_API_KEY\` and/or \`GROK_API_KEY\` in your backend \`.env\` file are set, active, and have sufficient billing credits to execute requests.
+> * **For Developers:** Please check and verify that your \`OPENROUTER_API_KEY\` and/or \`GROK_API_KEY\` in your backend \`.env\` file are set, active, and have sufficient billing credits to execute requests.
 > * **For Travelers:** While we wait for the AI endpoints to reset, here is a localized backup itinerary we prepared for you to get started:
 > 
 `;
@@ -623,7 +566,7 @@ RAG Travel Guide Context:
 ${contextString}
 `;
 
-    // Map roles: model -> model (Google Gemini roles are 'user' and 'model')
+    // Map roles: model -> model (OpenRouter roles are 'user' and 'model')
     const contents = messages.map(m => ({
       role: m.role === 'model' ? 'model' : 'user',
       parts: [{ text: m.content }]
@@ -642,22 +585,22 @@ ${contextString}
       if (success) {
         queryHandled = true;
       } else {
-        this.logger.warn('Grok failed or is not available. Falling back to Gemini...');
+        this.logger.warn('Grok failed or is not available. Falling back to OpenRouter...');
       }
     }
 
     if (!queryHandled) {
-      // Default to Gemini for complex queries or easy/medium fallback
-      this.logger.log(`Routing query to Gemini: "${latestUserMessage}"`);
-      const success = await this.callGeminiChatStream(systemInstruction, contents, chunkWrapper);
+      // Default to OpenRouter for complex queries or easy/medium fallback
+      this.logger.log(`Routing query to OpenRouter: "${latestUserMessage}"`);
+      const success = await this.callOpenRouterChatStream(systemInstruction, contents, chunkWrapper);
       if (success) {
         queryHandled = true;
       }
     }
 
     if (!queryHandled && queryCategory === 'complex') {
-      // Last resort Grok fallback if Gemini fails on complex
-      this.logger.warn('Gemini failed. Trying Grok as fallback...');
+      // Last resort Grok fallback if OpenRouter fails on complex
+      this.logger.warn('OpenRouter failed. Trying Grok as fallback...');
       const successGrok = await this.callGrokChatStream(systemInstruction, contents, chunkWrapper);
       if (successGrok) {
         queryHandled = true;
@@ -743,8 +686,12 @@ ${contextString}
     if (section === 'summary') {
       const tips = this.extractSectionRaw(combined, 'travel_tips');
       const budget = this.extractSectionRaw(combined, 'budget_breakdown');
-      if (tips) baseContent += `\n\n## Travel Advice & Tips\n${tips}`;
-      if (budget) baseContent += `\n\n## Estimated Budget Breakdown\n${budget}`;
+      if (tips && !baseContent.includes('## Travel Advice')) {
+        baseContent += `\n\n## Travel Advice & Tips\n${tips}`;
+      }
+      if (budget && !baseContent.includes('## Estimated Budget Breakdown')) {
+        baseContent += `\n\n## Estimated Budget Breakdown\n${budget}`;
+      }
     }
     
     return baseContent;
@@ -760,16 +707,23 @@ ${contextString}
   }
 
   private async callCombinedPlanGenerationStream(trip: any, context: string, onChunk: (text: string) => void): Promise<string> {
+    const from = new Date(trip.fromDate);
+    const to = new Date(trip.toDate);
+    const validDates = !isNaN(from.getTime()) && !isNaN(to.getTime());
+    const nights = validDates ? Math.max(1, Math.round((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24))) : 5;
+    const days = nights + 1;
+    const currency = trip.currency || 'USD';
+
     const prompt = `You are JetSet.AI, a premium travel companion. Generate a comprehensive travel plan for a trip to ${trip.destination}.
 
 Trip Parameters:
 - Origin: ${trip.origin || 'Unknown'}
 - Destination: ${trip.destination}
-- Dates: From ${trip.fromDate} to ${trip.toDate}
+- Dates: From ${trip.fromDate} to ${trip.toDate} (${days} Days / ${nights} Nights)
 - Budget Tier: ${trip.budget}
 - Travelers: ${trip.companions}
 - Selected Interests: ${trip.interests?.join(', ') || 'General travel'}
-- Currency: ${trip.currency || 'USD'}
+- Currency: ${currency}
 
 RAG Travel Context for ${trip.destination}:
 ${context}
@@ -778,26 +732,70 @@ Generate the response in the exact format shown below, using the delimiters. Do 
 CRITICAL CONSTRAINT: Never mention system/AI terminology, internal databases, information limitations, or 'RAG' / 'context documents'. Behave strictly as a native, expert travel guide who has direct and complete knowledge of ${trip.destination}. Speak to the user directly without reference to the backend processing or source boundaries.
 
 ---SUMMARY_START---
-Generate a structured, engaging 3-5 paragraph trip narrative summary. Include local highlights, culture, and packing advice. Do not include a title.
+## AI Blueprint Synthesis
+Write one comprehensive introductory paragraph (4-6 sentences) that captures the essence of ${trip.destination} as a travel destination, tuned to a ${trip.companions} traveler on a ${trip.budget} budget. Mention cultural highlights, atmosphere, and one or two unmissable experiences. This paragraph must be fully self-contained.
+
+## Travel Advice & Tips
+
+### Safety & Health
+- 2-3 specific, actionable safety and health bullet points for ${trip.destination}.
+
+### Scams to Avoid
+- 2-3 specific tourist scams or traps to avoid in ${trip.destination}.
+
+### Transport
+- 2-3 specific local transport options (metro, buses, taxis, ride-shares, airport transit) with pricing guidance.
+
+### Currency & Payments
+- 2-3 specific tips on currency, card acceptance, ATMs, and cash handling in ${trip.destination}.
+
+### Cultural Etiquette
+- 2-3 local customs, dress codes, tipping norms, and cultural considerations.
+
+### Weather & Packing
+- 2-3 seasonal packing and weather tips for ${trip.destination} during ${trip.fromDate} to ${trip.toDate}.
+
+## Estimated Budget Breakdown
+
+Estimated Total Budget (${currency}) – ${trip.budget} ${trip.companions} Traveler (${days} Days / ${nights} Nights)
+
+CRITICAL BUDGET INSTRUCTION: You MUST calculate the ENTIRE TRIP CUMULATIVE BUDGET (Total cost across all ${days} days and ${nights} nights), NOT per-day rates.
+- Flights: Full round-trip ticket cost for the entire journey (${trip.origin} ↔ ${trip.destination}) in ${currency}.
+  * FLIGHT PRICING CALIBRATION: Must accurately reflect real-world live market averages from Google Flights, MakeMyTrip, Goibibo, and JetSet Flights tab data. DO NOT underestimate flight fares.
+  * For international long-haul flights (e.g., India ↔ Europe/Americas/Australia), real-world economy fares on Google Flights & MakeMyTrip average 40,000 to 55,000 INR (~$500–$650 USD / €450–€600) for ONE-WAY, totaling approx 80,000 to 110,000 INR (~$1,000–$1,300 USD / €900–€1,200) for ROUND-TRIP per traveler.
+  * For international short-haul flights (e.g., India ↔ Southeast Asia / Middle East), one-way averages 15,000 to 25,000 INR, totaling approx 30,000 to 50,000 INR round-trip per traveler.
+  * For domestic flights (intra-country), one-way averages 5,000 to 9,000 INR, totaling approx 10,000 to 18,000 INR round-trip per traveler.
+  * MUST explicitly itemize both legs in the Details column (e.g., "Outbound: ~45,000 INR + Return: ~45,000 INR = Total 90,000 INR (avg. of Google Flights & MakeMyTrip live rates). 1-stop via Delhi/Doha, economy with 23kg check-in baggage"). Both outbound and return flight amounts must be fully included in the Flights row cost.
+- Accommodation: Full total cost for all ${nights} nights (${nights} nights × nightly rate) in ${currency}.
+- Domestic & Local Transport: Full total transit cost for the entire trip (airport transfers, metro, buses, taxis, day trips) in ${currency}.
+- Meals & Drinks: Full total food & drinks cost for all ${days} days (${days} days × daily dining) in ${currency}.
+- Activities & Entrance Fees: Full total cost of all museum tickets, guided tours, and landmark passes from the itinerary in ${currency}.
+- Miscellaneous & Contingency: Full total buffer for SIM card, souvenirs, tips, and unexpected expenses in ${currency}.
+- Total Approx.: Grand total sum of all categories for the entire trip in ${currency}.
+
+Format strictly as a markdown table with 3 columns:
+| Category | Approx. Cost (${currency}) | Details |
+|---|---|---|
+| Flights (${trip.origin} ↔ ${trip.destination}) | [Total round-trip flight cost in ${currency}] | [Outbound: ~[X] ${currency} + Return: ~[Y] ${currency} = [Total Z] ${currency} (market average based on Google Flights, MakeMyTrip, Goibibo). Route details, baggage/taxes included] |
+| Domestic & Local Transport | [Total transport cost for trip in ${currency}] | [Airport transfers, taxis/app rides, metro/bus, day-trip transit] |
+| Accommodation (${trip.budget} hotel/stays, ${nights} nights) | [Total stay cost for ${nights} nights in ${currency}] | [~[Nightly Rate] ${currency}/night × ${nights} nights in central neighborhoods] |
+| Meals & Drinks (${days} days) | [Total meals cost for ${days} days in ${currency}] | [Average ~[Daily Rate] ${currency}/day × ${days} days (cafes, street food, dining)] |
+| Activities & Entrance Fees | [Total activities cost for trip in ${currency}] | [Key attractions, museum passes, and tours from the itinerary] |
+| Miscellaneous & Contingency | [Total buffer in ${currency}] | [SIM card, souvenirs, tips, insurance, emergency buffer] |
+| **Total Approx.** | **[Grand total sum in ${currency}]** | **[Overall summary of entire trip budget and comfort level]** |
 ---SUMMARY_END---
 
 ---ITINERARY_START---
-Generate a detailed day-by-day travel itinerary. Use the format:
+Generate a detailed day-by-day travel itinerary for ${days} days (from ${trip.fromDate} to ${trip.toDate}). Use the format:
 Day 1: Arrival & Exploration
 - Activity or tip
 - Activity or tip
 
 Day 2: ...
 - ...
----ITINERARY_END---
-
----TRAVEL_TIPS_START---
-Provide key travel advice, safety tips, scams to avoid, and transport options.
----TRAVEL_TIPS_END---
-
----BUDGET_BREAKDOWN_START---
-Provide estimated budget breakdown details.
----BUDGET_BREAKDOWN_END---`;
+Day ${days}: Departure & Wrap-up
+- Activity or tip
+---ITINERARY_END`;
 
     let fullResponse = '';
     const wrapper = (chunk: string) => { fullResponse += chunk; onChunk(chunk); };
@@ -809,8 +807,8 @@ Provide estimated budget breakdown details.
       ok = await this.callGrokChatStream('You are JetSet.AI, a comprehensive AI travel planner.', contents, wrapper);
     }
     if (!ok) {
-      this.logger.log('Streaming combined plan generation using Gemini fallback...');
-      ok = await this.callGeminiChatStream('You are JetSet.AI, a comprehensive AI travel planner.', contents, wrapper);
+      this.logger.log('Streaming combined plan generation using OpenRouter fallback...');
+      ok = await this.callOpenRouterChatStream('You are JetSet.AI, a comprehensive AI travel planner.', contents, wrapper);
     }
 
     if (!ok) {
@@ -841,14 +839,14 @@ Do not write a massive month-by-month table or huge essays. Keep the entire resp
     // Call Groq (Llama 3.3) for blazing fast initial generation
     let success = await this.callGrokChatStream('You are an expert travel guide who gives high-impact, engaging and concise seasonal travel advice.', contents, wrapper);
     if (!success) {
-      success = await this.callGeminiChatStream('You are an expert travel guide who gives high-impact, engaging and concise seasonal travel advice.', contents, wrapper);
+      success = await this.callOpenRouterChatStream('You are an expert travel guide who gives high-impact, engaging and concise seasonal travel advice.', contents, wrapper);
     }
     if (!success) {
-      const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
+      const openrouterKey = this.configService.get<string>('OPENROUTER_API_KEY');
       const grokKey = this.configService.get<string>('GROK_API_KEY');
       let reason = 'The AI model quota limits have been temporarily exceeded or the API services returned a rate limit error (429).';
-      if (!geminiKey && !grokKey) {
-        reason = 'Both GEMINI_API_KEY and GROK_API_KEY are missing from the backend configuration.';
+      if (!openrouterKey && !grokKey) {
+        reason = 'Both OPENROUTER_API_KEY and GROK_API_KEY are missing from the backend configuration.';
       }
       const apology = `
 ## 📅 Seasonal Guide Unavailable
@@ -856,7 +854,7 @@ Do not write a massive month-by-month table or huge essays. Keep the entire resp
 We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
 **Reason:** ${reason}
 
-* **For Developers:** Please check that your \`GEMINI_API_KEY\` or \`GROK_API_KEY\` is configured and active in your backend settings.
+* **For Developers:** Please check that your \`OPENROUTER_API_KEY\` or \`GROK_API_KEY\` is configured and active in your backend settings.
 * **For Travelers:** Please try checking back later or explore another destination tab!
 `;
       onChunk(apology);
@@ -870,9 +868,12 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
     try {
       const config = this.getGrokConfig();
 
-      // Hard connection timeout — if Grok doesn't respond within limit, fall back immediately
+      // Abort controller covers BOTH the initial connection AND the streaming read loop.
       const controller = new AbortController();
-      const connectionTimer = setTimeout(() => controller.abort(), this.AI_REQUEST_TIMEOUT_MS);
+      const streamTimer = setTimeout(() => {
+        controller.abort();
+        this.logger.warn('Grok stream read timeout — aborting SSE loop');
+      }, this.GROK_STREAM_READ_TIMEOUT_MS);
 
       let res: Response;
       try {
@@ -889,16 +890,19 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
             ]
           })
         });
-      } finally {
-        clearTimeout(connectionTimer);
+      } catch (fetchErr: any) {
+        clearTimeout(streamTimer);
+        throw fetchErr;
       }
 
       if (!res.ok) {
+        clearTimeout(streamTimer);
         const errText = await res.text().catch(() => '');
         this.tripGrokCircuit(`stream status ${res.status}: ${errText.slice(0, 100)}`);
         return false;
       }
       if (!res.body) {
+        clearTimeout(streamTimer);
         this.tripGrokCircuit('stream body was null');
         return false;
       }
@@ -908,27 +912,32 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
       const decoder = new TextDecoder();
       let buffer = '';
 
-      if (typeof reader.read !== 'function') {
-        for await (const chunk of reader) {
-          buffer += decoder.decode(chunk, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) this.parseGrokSseLine(line, onChunk);
+      try {
+        if (typeof reader.read !== 'function') {
+          for await (const chunk of reader) {
+            buffer += decoder.decode(chunk, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) this.parseGrokSseLine(line, onChunk);
+          }
+        } else {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) this.parseGrokSseLine(line, onChunk);
+          }
         }
-      } else {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) this.parseGrokSseLine(line, onChunk);
-        }
+      } finally {
+        clearTimeout(streamTimer);
+        try { reader.cancel?.(); } catch {}
       }
       return true;
     } catch (err: any) {
       this.tripGrokCircuit(err.message);
-      this.logger.error(`Grok stream error: ${err.message} — falling back to Gemini`);
+      this.logger.error(`Grok stream error: ${err.message} — falling back to OpenRouter`);
       return false;
     }
   }
@@ -945,83 +954,24 @@ We are sincerely sorry, but our seasonal AI advisor is temporarily offline.
       } catch {}
     }
   }
-  private async callGeminiChatStream(system: string, contents: any[], onChunk: (text: string) => void): Promise<boolean> {
-    if (!this.hasApiKey) {
-      this.logger.warn('callGeminiChatStream: No GEMINI_API_KEY configured');
+  private async callOpenRouterChatStream(system: string, contents: any[], onChunk: (text: string) => void): Promise<boolean> {
+    if (!this.openRouterService.hasKey) {
+      this.logger.warn('callOpenRouterChatStream: No OPENROUTER_API_KEY configured');
       return false;
     }
-    const apiKey = this.configService.get<string>('GEMINI_API_KEY');
 
-    // Normalize contents: support both {role,content} (OpenAI style) and {role,parts} (Gemini style)
-    const normalizedContents = contents.map(c => ({
-      role: c.role === 'model' ? 'model' : 'user',
-      parts: c.parts ? c.parts : [{ text: c.content || '' }]
-    }));
+    const messages: OpenRouterMessage[] = [
+      { role: 'system', content: system },
+      ...contents.map(c => ({
+        role: (c.role === 'model' || c.role === 'assistant' ? 'assistant' : 'user') as 'assistant' | 'user',
+        content: c.parts ? c.parts.map((p: any) => p.text).join('') : (c.content || ''),
+      }))
+    ];
 
-    const models = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
-    for (const model of models) {
-      try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${apiKey}&alt=sse`;
-        const body = JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: normalizedContents,
-        });
-        const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
-        if (!res.ok) {
-          const errText = await res.text().catch(() => '');
-          this.logger.warn(`Gemini model ${model} returned ${res.status}: ${errText.slice(0, 200)}`);
-          if (res.status === 429 || res.status === 503) continue; // retry with next model
-          return false;
-        }
-        await this.consumeSseStream(res.body, onChunk);
-        return true;
-      } catch (err: any) {
-        this.logger.error(`callGeminiChatStream error with model ${model}: ${err.message}`);
-        continue;
-      }
-    }
-    return false;
-  }
-  private async consumeSseStream(body: any, onChunk: (text: string) => void) {
-    if (!body) return;
-    const reader = body.getReader ? body.getReader() : body;
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    const parseLine = (line: string) => {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('data: ')) {
-        const dataStr = trimmed.slice(6).trim();
-        if (dataStr === '[DONE]') return;
-        try {
-          const parsed = JSON.parse(dataStr);
-          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (text) onChunk(text);
-        } catch {}
-      }
-    };
-
-    if (typeof reader.read !== 'function') {
-      for await (const chunk of reader) {
-        buffer += decoder.decode(chunk, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          parseLine(line);
-        }
-      }
-    } else {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          parseLine(line);
-        }
-      }
-    }
+    return await this.openRouterService.chatStream({
+      messages,
+      onChunk,
+    });
   }
 
   private async streamMockSummary(trip: any, context: string, onChunk: (text: string) => void, onComplete: () => void) {
@@ -1033,7 +983,7 @@ You are embarking on a **${trip.budget}** trip from **${trip.origin}** as a **${
 #### 📍 Local Highlights & Insights
 Based on our guide context, if you are visiting, make sure to explore the primary landmarks (like the Eiffel Tower or Senso-ji Temple) and purchase public transit passes.
 
-#### 💡 Expert Tips (Powered by Google Gemini)
+#### 💡 Expert Tips (Powered by JetSet AI)
 * **Transport:** Save money by acquiring local multi-ride tickets or tapping card readers (e.g. OMNY / Navigo passes).
 * **Safety:** Exercise normal vigilance against pickpockets in crowded tourist spots.
 * **Dining:** Eat like a local by trying lunch sets or local convenience store snacks to keep food costs reasonable.
@@ -1051,12 +1001,6 @@ Based on our guide context, if you are visiting, make sure to explore the primar
   }
 
   async analyzeFlights(flights: any[], trip: any): Promise<any[]> {
-    const apiKey = this.configService.get<string>('GEMINI_API_KEY');
-    if (!apiKey || apiKey.trim() === '') {
-      this.logger.warn('No GEMINI_API_KEY. Using heuristic flight recommendations.');
-      return this.heuristicAnalyzeFlights(flights, trip);
-    }
-
     try {
       const prompt = `
 You are JetSet.AI, an expert travel optimization system.
@@ -1082,17 +1026,12 @@ ${JSON.stringify(flights.map(f => ({
 })), null, 2)}
 
 Task:
-Analyze each flight and evaluate how well it fits the traveler's itinerary and preferences (stay duration, budget tier, companion, travel time, arrival time, convenience, interests):
-- A shorter trip stay (e.g. 1-3 days) needs faster/more direct flights to maximize time.
-- Interests like "culture" or "sightseeing" benefit from flights arriving in the morning or early afternoon so they can utilize the first day.
-- A "budget" or "mid-range" traveler values cheaper flights.
-- A traveler with companions (e.g. family, kids, couple) might prefer fewer stops/shorter layovers/more convenient timings.
-
+Analyze each flight and evaluate how well it fits the traveler's itinerary and preferences (stay duration, budget tier, companion, travel time, arrival time, convenience, interests).
 For EACH flight ID in the input list, generate:
 1. An AI match score between 0 and 100 representing how suitable this flight is.
-2. A brief, personalized 1-2 sentence recommendation reason explanation highlighting specific reasons related to the trip parameters (e.g. "Perfect for your short 3-day stay as it is direct and lands at 9 AM, giving you a full first day for Culture sights"). Do not mention code details. Refer to the traveler in second person.
+2. A brief, personalized 1-2 sentence recommendation reason explanation highlighting specific reasons related to the trip parameters (refer to the traveler in second person).
 
-Output your answer in raw JSON format matching this schema. Do not output any markdown code blocks or wrapping. Just the JSON:
+Output your answer in raw JSON format matching this schema:
 {
   "analyses": [
     {
@@ -1104,34 +1043,21 @@ Output your answer in raw JSON format matching this schema. Do not output any ma
 }
 `;
 
-      const geminiModels = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
-      let resultText = '';
-      for (const model of geminiModels) {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-        });
-        if (res.ok) {
-          const resData = await res.json();
-          resultText = resData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          if (resultText) break;
-        }
-        this.logger.warn(`Model ${model} failed for flight analysis, trying next...`);
-      }
+      const resultText = await this.callModelWithFallback(
+        prompt,
+        'You are JetSet.AI, an expert flight evaluation system. Return strictly raw JSON.',
+        true
+      );
 
-      if (!resultText) {
-        throw new Error('No content returned from Gemini');
-      }
-
-      const cleanJson = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
+      const cleanJson = resultText.replace(/```json/gi, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(cleanJson);
-      return parsed.analyses;
-
+      if (parsed?.analyses && Array.isArray(parsed.analyses)) {
+        return parsed.analyses;
+      }
     } catch (e: any) {
-      this.logger.error(`Failed to analyze flights with Gemini: ${e.message}. Using heuristic fallback.`);
-      return this.heuristicAnalyzeFlights(flights, trip);
+      this.logger.error(`Failed to analyze flights with AI: ${e.message}. Using heuristic fallback.`);
     }
+    return this.heuristicAnalyzeFlights(flights, trip);
   }
 
   private calculateStayDays(from: string, to: string): number {
@@ -1209,7 +1135,7 @@ Output your answer in raw JSON format matching this schema. Do not output any ma
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Smart Flight Leg Extraction (Gemini AI — determines flyable legs only)
+  // Smart Flight Leg Extraction (OpenRouter AI — determines flyable legs only)
   // ─────────────────────────────────────────────────────────────────────────────
 
   async extractFlightLegs(trip: {
@@ -1226,13 +1152,13 @@ Output your answer in raw JSON format matching this schema. Do not output any ma
       ? this.extractSection(trip.combinedPlan, 'itinerary')
       : '';
 
-    const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
+    const openrouterKey = this.configService.get<string>('OPENROUTER_API_KEY');
     const grokKey = this.configService.get<string>('GROK_API_KEY');
-    const hasKey = (geminiKey && geminiKey.trim() !== '') || (grokKey && grokKey.trim() !== '');
+    const hasKey = (openrouterKey && openrouterKey.trim() !== '') || (grokKey && grokKey.trim() !== '');
 
     if (hasKey) {
       try {
-        const result = await this.geminiExtractFlightLegs(trip, itineraryText);
+        const result = await this.aiExtractFlightLegs(trip, itineraryText);
         if (result) return result;
       } catch (e: any) {
         this.logger.warn(`Flight leg extraction failed: ${e.message}. Using fallback.`);
@@ -1297,7 +1223,7 @@ Output ONLY a raw JSON object matching this schema (no markdown formatting, no e
     return { isSensitive: false, isOffSeason: false, warningTitle: null, warningMessage: null };
   }
 
-  private async geminiExtractFlightLegs(
+  private async aiExtractFlightLegs(
     trip: { origin: string; destination: string; fromDate: string; toDate: string; budget?: string; companions?: string; currency?: string },
     itineraryText: string,
   ): Promise<FlightLegsDto | null> {
@@ -1406,7 +1332,7 @@ Rules:
     return null;
   }
 
-  private fallbackFlightLegs(trip: { origin: string; destination: string; fromDate: string; toDate: string }): FlightLegsDto {
+  public fallbackFlightLegs(trip: { origin: string; destination: string; fromDate: string; toDate: string }): FlightLegsDto {
     // Simple direct + return fallback using static IATA mapping
     const STATIC: Record<string, string> = {
       'bhubaneswar': 'BBI', 'bhubaneshwar': 'BBI', 'cuttack': 'BBI',
@@ -1429,14 +1355,14 @@ Rules:
     return {
       gateway: destCity,
       gatewayIata: destIata,
-      outbound: [{ legNum: 1, from: orgCity,  fromIata: orgIata,  to: destCity, toIata: destIata, date: trip.fromDate, note: 'Direct flight' }],
+      outbound: [{ legNum: 1, from: orgCity,  fromIata: orgIata,  to: destCity, toIata: destIata, date: trip.fromDate, note: 'Commercial flight' }],
       return:   [{ legNum: 2, from: destCity, fromIata: destIata, to: orgCity,  toIata: orgIata,  date: trip.toDate,   note: 'Return flight' }],
       groundSegments: [],
     };
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Itinerary Stop Extraction (Gemini-powered, regex fallback)
+  // Itinerary Stop Extraction (OpenRouter-powered, regex fallback)
   // ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1451,27 +1377,8 @@ Rules:
       return this.buildFallbackStop(destination, fromDate, toDate);
     }
 
-    const apiKey = this.configService.get<string>('GEMINI_API_KEY');
-    if (apiKey && apiKey.trim() !== '') {
-      try {
-        const result = await this.geminiExtractStops(itineraryText, fromDate, destination, apiKey);
-        if (result && result.length > 0) return result;
-      } catch (e: any) {
-        this.logger.warn(`Gemini stop extraction failed: ${e.message}. Using regex fallback.`);
-      }
-    }
-
-    // Regex fallback
-    return this.regexExtractStops(itineraryText, fromDate, toDate, destination);
-  }
-
-  private async geminiExtractStops(
-    itineraryText: string,
-    fromDate: string,
-    destination: string,
-    apiKey: string,
-  ): Promise<ItineraryStopDto[]> {
-    const prompt = `You are a travel itinerary parser. Given the following day-by-day travel itinerary, extract each UNIQUE city/destination where the traveller will STAY OVERNIGHT (i.e., needs a hotel). Group consecutive days in the same city.
+    try {
+      const prompt = `You are a travel itinerary parser. Given the following day-by-day travel itinerary, extract each UNIQUE city/destination where the traveller will STAY OVERNIGHT (i.e., needs a hotel). Group consecutive days in the same city.
 
 Trip start date: ${fromDate}
 Overall destination: ${destination}
@@ -1479,7 +1386,7 @@ Overall destination: ${destination}
 Itinerary:
 ${itineraryText}
 
-Return a JSON array (no markdown, no explanation) of objects with this schema:
+Return a JSON array of objects with this schema:
 [
   { "city": "City Name", "dayStart": 1, "dayEnd": 2 },
   { "city": "Another City", "dayStart": 3, "dayEnd": 5 }
@@ -1490,30 +1397,24 @@ Rules:
 - "city" must be the real geographic city/town name — NOT words like "Arrival", "Departure", "Leisure", "Exploration", "Rest".
 - Group consecutive days spent in the same city into ONE entry.
 - Day numbers refer to the trip day (Day 1 = first day of trip).
-- If a day says "Return to X" or "Back to X", that city is still a valid stop.
 - If unsure about exact city, use the nearest well-known city.
 `;
 
-    const models = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
-    for (const model of models) {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-        }
+      const resultText = await this.callModelWithFallback(
+        prompt,
+        'You are a travel itinerary parser. Output strictly valid JSON.',
+        true
       );
-      if (!res.ok) continue;
-      const data = await res.json();
-      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      const clean = raw.replace(/```json/g, '').replace(/```/g, '').trim();
+      const clean = resultText.replace(/```json/gi, '').replace(/```/g, '').trim();
       const parsed: Array<{ city: string; dayStart: number; dayEnd: number }> = JSON.parse(clean);
-      if (!Array.isArray(parsed) || parsed.length === 0) continue;
-
-      return this.computeDates(parsed, fromDate);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return this.computeDates(parsed, fromDate);
+      }
+    } catch (e: any) {
+      this.logger.warn(`AI stop extraction failed: ${e.message}. Using regex fallback.`);
     }
-    return [];
+
+    return this.regexExtractStops(itineraryText, fromDate, toDate, destination);
   }
 
   private regexExtractStops(
@@ -1552,7 +1453,7 @@ Rules:
       'seoul': 'Seoul', 'beijing': 'Beijing', 'shanghai': 'Shanghai',
     };
 
-    // INVALID non-city words that regex/Gemini might incorrectly pick up
+    // INVALID non-city words that regex/OpenRouter might incorrectly pick up
     const INVALID_CITIES = new Set([
       'arrival', 'departure', 'leisure', 'rest', 'acclimatization', 'exploration',
       'sightseeing', 'transfer', 'transit', 'journey', 'excursion', 'day',
@@ -1652,7 +1553,7 @@ Rules:
     });
   }
 
-  private buildFallbackStop(destination: string, fromDate: string, toDate: string): ItineraryStopDto[] {
+  public buildFallbackStop(destination: string, fromDate: string, toDate: string): ItineraryStopDto[] {
     const ci = new Date(fromDate || Date.now());
     const co = new Date(toDate || Date.now());
     if (isNaN(co.getTime())) co.setDate(ci.getDate() + 1);
@@ -1679,12 +1580,6 @@ Rules:
 
 
   async analyzeHotels(hotels: any[], trip: any): Promise<any[]> {
-    const apiKey = this.configService.get<string>('GEMINI_API_KEY');
-    if (!apiKey || apiKey.trim() === '') {
-      this.logger.warn('No GEMINI_API_KEY. Using heuristic hotel recommendations.');
-      return this.heuristicAnalyzeHotels(hotels, trip);
-    }
-
     try {
       const prompt = `
 You are JetSet.AI, an expert travel hotel optimization system.
@@ -1702,27 +1597,17 @@ ${JSON.stringify(hotels.map(h => ({
   id: h.hotelId,
   name: h.name,
   rating: h.rating,
-  price: `$${h.price} per night`,
+  price: `${h.price} per night`,
   distance: h.distance ? `${h.distance} km` : '1.5 km'
 })), null, 2)}
 
 Task:
-Analyze each hotel and evaluate how well it fits the traveler's itinerary and preferences (stay duration, budget tier, companion type, interests, review score, location/proximity):
-- Companions: 
-  * "Solo": prefers hostels, central apartments, social zones, close to transit stations.
-  * "Couple": prefers romantic, boutique, quiet, top-rated hotels, high scores.
-  * "Family": prefers spacious rooms, quiet areas, kid-friendly parks nearby, high ratings.
-  * "Friends": prefers central, lively spots, nightlife.
-- Interests: Match interests to hotel styles or surroundings (e.g., historical zones for "culture", food hubs for "food").
-- Proximity to key places (airport, train station, city center).
-- Review Score: High reviews/ratings must be prioritized.
-- Price: Lower prices matching their budget are preferred.
-
+Analyze each hotel and evaluate how well it fits the traveler's itinerary and preferences (stay duration, budget tier, companion type, interests, review score, location/proximity).
 For EACH hotel ID in the input list, generate:
 1. An AI match score between 0 and 100 representing suitability. Score higher for hotels with better reviews (ratings), better value/prices, and alignment with traveler options.
-2. A brief, personalized 1-2 sentence recommendation reason in second person (e.g. "Excellent for your solo trip; budget-friendly and located near the train station and cultural spots").
+2. A brief, personalized 1-2 sentence recommendation reason in second person.
 
-Output raw JSON format matching this schema. Do not output any markdown code blocks. Just the JSON:
+Output raw JSON format matching this schema:
 {
   "analyses": [
     {
@@ -1734,33 +1619,20 @@ Output raw JSON format matching this schema. Do not output any markdown code blo
 }
 `;
 
-      const geminiModels = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
-      let resultText = '';
-      for (const model of geminiModels) {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-        });
-        if (res.ok) {
-          const resData = await res.json();
-          resultText = resData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          if (resultText) break;
-        }
-      }
-
-      if (!resultText) {
-        throw new Error('No content returned from Gemini');
-      }
-
-      const cleanJson = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
+      const resultText = await this.callModelWithFallback(
+        prompt,
+        'You are an expert hotel evaluation system. Output strictly raw JSON.',
+        true
+      );
+      const cleanJson = resultText.replace(/```json/gi, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(cleanJson);
-      return parsed.analyses;
-
+      if (parsed?.analyses && Array.isArray(parsed.analyses)) {
+        return parsed.analyses;
+      }
     } catch (e: any) {
-      this.logger.error(`Failed to analyze hotels with Gemini: ${e.message}. Using heuristic fallback.`);
-      return this.heuristicAnalyzeHotels(hotels, trip);
+      this.logger.error(`Failed to analyze hotels with AI: ${e.message}. Using heuristic fallback.`);
     }
+    return this.heuristicAnalyzeHotels(hotels, trip);
   }
 
   private heuristicAnalyzeHotels(hotels: any[], trip: any): any[] {
@@ -1883,9 +1755,6 @@ Output raw JSON format matching this schema. Do not output any markdown code blo
   }
 
   async explainHotelsWithGrok(topHotels: any[], trip: any): Promise<Record<string, { score: number; reason: string }>> {
-    const grokKey = this.configService.get<string>('GROK_API_KEY');
-    const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
-    
     const prompt = `
 You are JetSet.AI, an expert travel hotel optimization system.
 The traveler has the following profile:
@@ -1900,23 +1769,23 @@ ${JSON.stringify(topHotels.map(h => ({
   id: h.hotelId,
   name: h.name,
   rating: h.rating,
-  price: `$${h.price} per night`,
+  price: `${h.price} per night`,
   distance: h.distance ? `${h.distance} km` : '1.5 km'
 })), null, 2)}
 
 Task:
-Analyze each hotel using the FOLLOWING PRIORITY ORDER — do NOT rank primarily on review ratings alone:
-1. BUDGET FIT (most important, 30%): Does the price match the traveler's selected budget tier? A luxury hotel priced for budget travelers scores LOW, and vice versa. Match the tier precisely.
-2. TRAVELER CONVENIENCE & COMPANIONS (25%): Does it genuinely suit the companion type? Family travelers need spacious, child-friendly resorts. Couples need romantic boutique options. Solo travelers need social/central hostels or compact hotels. Friends need proximity to nightlife/attractions.
-3. SELECTED INTERESTS (20%): Does the location or hotel type align with their interests (e.g. culture, nature, adventure, food, wellness, shopping)?
-4. EASE OF TRAVEL (15%): Is it conveniently located near transport links, walkable zones, or key local landmarks that reduce hassle?
-5. REVIEW QUALITY (10%): High reviews are a positive bonus, but never override the above factors.
+Analyze each hotel using the FOLLOWING PRIORITY ORDER:
+1. BUDGET FIT (30%)
+2. TRAVELER CONVENIENCE & COMPANIONS (25%)
+3. SELECTED INTERESTS (20%)
+4. EASE OF TRAVEL (15%)
+5. REVIEW QUALITY (10%)
 
 For EACH hotel, generate:
-1. An AI match score between 0 and 100 based on the priority weights above (not just star rating).
-2. A brief, personalized 1-2 sentence recommendation in second person that explains why it is or isn't a strong match given their profile. If it's a poor budget fit, say so clearly.
+1. An AI match score between 0 and 100 based on the priority weights above.
+2. A brief, personalized 1-2 sentence recommendation in second person.
 
-Output your answer in raw JSON format matching this schema. Do not output any markdown code blocks or wrapping. Just the JSON:
+Output your answer in raw JSON format matching this schema:
 {
   "analyses": [
     {
@@ -1928,77 +1797,23 @@ Output your answer in raw JSON format matching this schema. Do not output any ma
 }
 `;
 
-    // Try Grok first (with dynamic client routing based on key prefix)
-    if (grokKey && grokKey.trim() !== '') {
-      try {
-        this.logger.log('Generating hotel explanations using Groq/Grok...');
-        const config = this.getGrokConfig();
-        const res = await fetch(config.url, {
-          method: 'POST',
-          headers: config.headers,
-          body: JSON.stringify({
-            model: config.model,
-            response_format: { type: 'json_object' },
-            messages: [
-              { role: 'system', content: 'You are a professional travel planner returning strictly raw JSON.' },
-              { role: 'user', content: prompt }
-            ]
-          })
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-          const resultText = data.choices?.[0]?.message?.content || '';
-          if (resultText) {
-            const cleanJson = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
-            const parsed = JSON.parse(cleanJson);
-            if (parsed.analyses) {
-              const results: Record<string, { score: number; reason: string }> = {};
-              for (const a of parsed.analyses) {
-                results[a.id] = { score: a.score, reason: a.reason };
-              }
-              return results;
-            }
-          }
+    try {
+      const resultText = await this.callModelWithFallback(
+        prompt,
+        'You are a professional travel planner returning strictly raw JSON.',
+        true
+      );
+      const cleanJson = resultText.replace(/```json/gi, '').replace(/```/g, '').trim();
+      const parsed = JSON.parse(cleanJson);
+      if (parsed.analyses) {
+        const results: Record<string, { score: number; reason: string }> = {};
+        for (const a of parsed.analyses) {
+          results[a.id] = { score: a.score, reason: a.reason };
         }
-      } catch (e: any) {
-        this.logger.error(`Failed to generate hotel explanations with Grok: ${e.message}. Trying Gemini fallback...`);
+        return results;
       }
-    }
-
-    // Try Gemini fallback
-    if (geminiKey && geminiKey.trim() !== '') {
-      try {
-        this.logger.log('Generating hotel explanations using Gemini fallback...');
-        const geminiModels = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
-        let resultText = '';
-        for (const model of geminiModels) {
-          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-          });
-          if (res.ok) {
-            const resData = await res.json();
-            resultText = resData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            if (resultText) break;
-          }
-        }
-
-        if (resultText) {
-          const cleanJson = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
-          const parsed = JSON.parse(cleanJson);
-          if (parsed.analyses) {
-            const results: Record<string, { score: number; reason: string }> = {};
-            for (const a of parsed.analyses) {
-              results[a.id] = { score: a.score, reason: a.reason };
-            }
-            return results;
-          }
-        }
-      } catch (e: any) {
-        this.logger.error(`Failed to generate hotel explanations with Gemini: ${e.message}`);
-      }
+    } catch (e: any) {
+      this.logger.error(`Failed to generate hotel explanations: ${e.message}`);
     }
 
     const fallbackExplanations: Record<string, { score: number; reason: string }> = {};
@@ -2012,9 +1827,6 @@ Output your answer in raw JSON format matching this schema. Do not output any ma
   }
 
   async analyzeFlightsWithGrok(flights: any[], trip: any): Promise<Record<string, { score: number; reason: string }>> {
-    const grokKey = this.configService.get<string>('GROK_API_KEY');
-    const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
-
     const prompt = `
 You are JetSet.AI, an expert travel optimization system.
 The traveler has the following profile:
@@ -2041,7 +1853,7 @@ For EACH flight, generate:
 1. An AI match score between 0 and 100 representing how suitable this flight is.
 2. A brief, personalized 1-2 sentence recommendation reason explanation highlighting specific reasons related to the trip parameters (refer to the traveler in second person).
 
-Output your answer in raw JSON format matching this schema. Do not output any markdown code blocks or wrapping. Just the JSON:
+Output your answer in raw JSON format matching this schema:
 {
   "analyses": [
     {
@@ -2053,77 +1865,23 @@ Output your answer in raw JSON format matching this schema. Do not output any ma
 }
 `;
 
-    // Try Grok first
-    if (grokKey && grokKey.trim() !== '') {
-      try {
-        this.logger.log('Analyzing flights using Grok...');
-        const config = this.getGrokConfig();
-        const res = await fetch(config.url, {
-          method: 'POST',
-          headers: config.headers,
-          body: JSON.stringify({
-            model: config.model,
-            response_format: { type: 'json_object' },
-            messages: [
-              { role: 'system', content: 'You are a professional travel planner returning strictly raw JSON.' },
-              { role: 'user', content: prompt }
-            ]
-          })
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-          const resultText = data.choices?.[0]?.message?.content || '';
-          if (resultText) {
-            const cleanJson = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
-            const parsed = JSON.parse(cleanJson);
-            if (parsed.analyses) {
-              const results: Record<string, { score: number; reason: string }> = {};
-              for (const a of parsed.analyses) {
-                results[a.id] = { score: a.score, reason: a.reason };
-              }
-              return results;
-            }
-          }
+    try {
+      const resultText = await this.callModelWithFallback(
+        prompt,
+        'You are a professional travel planner returning strictly raw JSON.',
+        true
+      );
+      const cleanJson = resultText.replace(/```json/gi, '').replace(/```/g, '').trim();
+      const parsed = JSON.parse(cleanJson);
+      if (parsed.analyses) {
+        const results: Record<string, { score: number; reason: string }> = {};
+        for (const a of parsed.analyses) {
+          results[a.id] = { score: a.score, reason: a.reason };
         }
-      } catch (e: any) {
-        this.logger.error(`Failed to analyze flights with Grok: ${e.message}. Trying Gemini fallback...`);
+        return results;
       }
-    }
-
-    // Try Gemini fallback
-    if (geminiKey && geminiKey.trim() !== '') {
-      try {
-        this.logger.log('Analyzing flights using Gemini fallback...');
-        const geminiModels = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
-        let resultText = '';
-        for (const model of geminiModels) {
-          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-          });
-          if (res.ok) {
-            const resData = await res.json();
-            resultText = resData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            if (resultText) break;
-          }
-        }
-
-        if (resultText) {
-          const cleanJson = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
-          const parsed = JSON.parse(cleanJson);
-          if (parsed.analyses) {
-            const results: Record<string, { score: number; reason: string }> = {};
-            for (const a of parsed.analyses) {
-              results[a.id] = { score: a.score, reason: a.reason };
-            }
-            return results;
-          }
-        }
-      } catch (e: any) {
-        this.logger.error(`Failed to analyze flights with Gemini: ${e.message}`);
-      }
+    } catch (e: any) {
+      this.logger.error(`Failed to analyze flights: ${e.message}`);
     }
 
     return {};

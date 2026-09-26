@@ -26,7 +26,7 @@ export class LlmService {
             { role: 'system', content: systemPrompt },
             ...messages,
           ],
-          model: 'openai/gpt-oss-20b',
+          model: 'openai/gpt-oss-120b',
           stream: true,
           tools: [
             {
@@ -115,6 +115,40 @@ export class LlmService {
                     tabId: { type: 'string', enum: ['summary', 'flights', 'hotels', 'season', 'itinerary'] },
                   },
                   required: ['tabId'],
+                },
+              },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'modify_trip',
+                description: 'Modify trip parameters when the user wants to change their origin / starting city, destination, dates (extend, shorten, or move trip dates), budget, companions, or interests. Only include the fields that need to change.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    origin: { type: 'string', description: 'New departure / starting city or airport (e.g., "Bengaluru", "New York")' },
+                    destination: { type: 'string', description: 'New destination city or country (e.g., "Cusco", "Paris")' },
+                    fromDate: { type: 'string', description: 'New departure/start date (ISO format YYYY-MM-DD or readable date)' },
+                    toDate: { type: 'string', description: 'New return/end date (ISO format YYYY-MM-DD or readable date)' },
+                    budget: { type: 'string', description: 'New budget level (e.g., "budget", "moderate", "luxury")' },
+                    companions: { type: 'string', description: 'Updated travel companions (e.g., "solo", "couple", "family with kids")' },
+                    interests: { type: 'array', items: { type: 'string' }, description: 'Updated list of travel interests' },
+                  },
+                },
+              },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'edit_itinerary',
+                description: 'Edit or regenerate the travel itinerary based on user instructions. Use when the user wants to add activities, remove items, swap days, change pace, or fully regenerate their itinerary.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    instruction: { type: 'string', description: 'The user\'s edit instruction (e.g., "add a museum visit on day 2", "make it more relaxed", "swap day 1 and day 3")' },
+                    regenerate: { type: 'boolean', description: 'Set to true to fully regenerate the itinerary from scratch' },
+                  },
+                  required: ['instruction'],
                 },
               },
             },
