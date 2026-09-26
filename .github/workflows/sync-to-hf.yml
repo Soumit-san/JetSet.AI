@@ -1,0 +1,29 @@
+name: Sync Backend to Hugging Face Space
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sync-to-hf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Deploy backend subtree to Hugging Face Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Extract backend folder as a standalone commit tree for Hugging Face Space root
+          git subtree split --prefix backend -b hf-sync
+          
+          # Direct authenticated push to Hugging Face Space main branch
+          git push -f "https://SamD445:$HF_TOKEN@huggingface.co/spaces/SamD445/JetSet_AI" hf-sync:main

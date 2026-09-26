@@ -45,6 +45,3 @@ dist-ssr
 *.sw?
 
 .vercel
- 
-# Hugging Face specific deployment config (not pushed to GitHub)
-backend/README.md
