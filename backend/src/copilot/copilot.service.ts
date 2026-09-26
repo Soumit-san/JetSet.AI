@@ -6,7 +6,7 @@ import { TripsService } from '../trips/trips.service';
 import { AiService } from '../ai/ai.service';
 import * as jwt from 'jsonwebtoken';
 import { ConfigService } from '@nestjs/config';
-import { CopilotMessage, ToolCall } from '@jetset/shared';
+import { CopilotMessage, ToolCall } from './copilot.types';
 
 @Injectable()
 export class CopilotService {

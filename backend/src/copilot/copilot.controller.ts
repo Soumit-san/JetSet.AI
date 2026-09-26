@@ -1,7 +1,7 @@
 import { Controller, Post, Body, Res, Req, UnauthorizedException, HttpException, HttpStatus } from '@nestjs/common';
 import type { Response, Request } from 'express';
 import { CopilotService } from './copilot.service';
-import { CopilotMessage, CopilotResponsePayload } from '@jetset/shared';
+import { CopilotMessage, CopilotResponsePayload } from './copilot.types';
 import * as jwt from 'jsonwebtoken';
 
 @Controller('copilot')
